@@ -1,0 +1,129 @@
+# Calibrate one camera or both from a live feed, then check the result.
+#
+# The node collects board detections until `budget` frames have passed the
+# pose-diversity gate or the collection window (frames.max_duration_s) ends,
+# whichever comes first, then solves with what has arrived. The budget is a
+# ceiling, not a minimum; only a count below the calibrator's own floor fails.
+# For one camera it solves a mono calibration; for both it
+# solves each camera, optionally refines them jointly with the configured
+# extrinsic held constant, and checks each against the other's final intrinsics
+# on a shared holdout. The fixed extrinsic is never estimated. On a failed check
+# it retries the collection (see `attempts`).
+
+# --- goal -------------------------------------------------------------------
+
+# Camera key in the rig config ("left", "right", or "both"). Must exist there.
+string camera
+
+# Accepted-frame ceiling. 0 uses the config value (frames.budget). Collection
+# also ends at frames.max_duration_s, and the solve then uses whatever was
+# accepted rather than failing.
+uint32 budget
+
+# Run the calibration even when the cross-camera check cannot run at all --
+# no extrinsic configured, or no usable left/right pairs. Without this, a
+# missing check is reported as an error rather than silently skipped.
+bool allow_unchecked
+
+---
+
+# --- result -----------------------------------------------------------------
+
+bool   success
+string message
+
+# Intrinsics of the calibrated camera. The distortion model is purely radial:
+# k = 1 + d1*r^2 + d2*r^4, with no tangential term. d3/d4 are zero unless the
+# board config raises n_d above 2.
+float64 fx
+float64 fy
+float64 cx
+float64 cy
+float64 skew
+float64 d1
+float64 d2
+float64 d3
+float64 d4
+
+# 1-sigma uncertainties, from the calibrator's Jacobian (printed as 2sigma).
+float64 s_fx
+float64 s_fy
+float64 s_cx
+float64 s_cy
+float64 s_skew
+float64 s_d1
+float64 s_d2
+float64 s_d3
+float64 s_d4
+
+float64 reprojection_error
+uint32  n_frames              # accepted frames that went into the solve
+uint32  n_frames_heldout      # accepted frames reserved for the check
+string  camera_info_path      # written camera_info YAML; "" if not written
+
+# Held-out cross-camera consistency check: camera 0's held-out board detections
+# projected through the fixed extrinsic and compared against camera 1's actual
+# detections.
+bool    check_ran
+bool    check_passed
+uint32  check_pairs
+# RMS over every dot of every held-out pair, in pixels of the other camera.
+# This is the number `check_max_rms_px` is compared against.
+float64 check_rms_px
+# The limit it had to beat: check.max_rms_px from the rig config. Returned so a
+# result is interpretable without the config, and because a `check_passed` of
+# false is only meaningful next to the bar it missed.
+float64 check_max_rms_px
+# Worst single held-out pair. Always >= check_rms_px; a value far above it means
+# one frame dominates and the rest are fine, which is a different problem from a
+# uniformly bad calibration.
+float64 check_worst_pair_rms_px
+
+uint32  attempts              # 1 = passed first time, 2 = passed on retry
+
+# --- both-camera results ----------------------------------------------------
+#
+# Per-camera results. A mono goal ("left", "right", ...) returns exactly one
+# entry mirroring the scalar fields above, so existing mono consumers keep
+# working unchanged. A both-mode goal ("both" or "all") returns one entry per
+# camera, ordered by camera name ("left" before "right", std::map order).
+#
+# In both mode every scalar intrinsic field above is zeroed, success or
+# failure, so a consumer that ignores `cameras[]` cannot install one camera's
+# intrinsics as if they described the rig. `success`, `message` and the check
+# scalars still describe the overall goal; per-camera truth is in `cameras[]`.
+CameraCalibration[] cameras
+
+# True when the optional joint refinement ran and replaced both mono results.
+# The extrinsic was held bit-constant throughout; it is never estimated here.
+bool    joint_refined
+float64 joint_fit_seconds
+
+# The timestamped run directory and the `.dwecal` written into it. Empty for
+# mono goals, which keep writing into output.directory directly.
+string  run_directory
+string  dwecal_path           # "" when no .dwecal was written
+string  dwecal_sha256         # lowercase hex of dwecal_path; "" with it
+
+---
+
+# --- feedback ---------------------------------------------------------------
+
+# COLLECTING -> CALIBRATING -> DONE, or FAILED. A goal that fails its check and
+# has check.retries left goes back to COLLECTING with RETRYING first. There is no
+# separate CHECKING or WRITING state: the session solves, checks and writes
+# inside one call, so reporting those distinctly would be invented progress.
+string  state
+uint32  frames_seen           # frames received and decoded
+uint32  frames_detected       # board found with exactly n_x*n_y dots
+uint32  frames_accepted       # passed the pose-diversity gate
+uint32  frames_duplicate      # rejected by the pose-diversity gate
+uint32  frames_unpaired       # dropped: no simultaneous frame from the other camera
+uint32  budget
+float32 progress              # accepted / budget, capped at 1.0
+
+# Per-camera progress. A mono goal has one entry mirroring the scalar fields
+# above. A both-mode goal has one entry per camera, and the scalar fields above
+# mirror the first camera.
+uint32 cameras_in_goal
+CameraProgress[] cameras

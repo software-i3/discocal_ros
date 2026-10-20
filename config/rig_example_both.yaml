@@ -1,0 +1,206 @@
+# discocal_ros rig configuration -- BOTH-CAMERA EXAMPLE.
+#
+# Same rig measurements as config/rig_example.yaml, but both cameras are solved
+# in one goal and the result is written as camera_info YAMLs plus a .dwecal
+# rectification file. The extrinsic is still a fixed input: nothing in this
+# package ever estimates it.
+#
+#   rosrun discocal_ros discocal_ros_node _rig_config:=<this file>
+#   rosrun discocal_ros calibrate_client.py --camera both --budget 100
+#
+# With a recorded feed, scripts/benchmark_calibration.sh drives the same goal
+# from a bag. Replace every number with your own rig's before using it for real.
+
+board:
+  # "circle" is the moment/conic path (Calibrator::calibrate mode 0). Joint
+  # refinement supports only circle boards; square boards still calibrate both
+  # cameras independently, with the joint stage skipped and logged.
+  type: circle
+
+  # 7 dots along a row, 5 along a column; 29 mm dot diameter (radius below),
+  # 39 mm centre-to-centre. Measured from calibration_set_big.
+  n_x: 7
+  n_y: 5
+  radius: 0.0145        # metres; dot RADIUS, not diameter
+  distance: 0.039       # metres; centre-to-centre pitch
+  asymmetric: false
+
+  # "" -> BGR2GRAY; "saturation" -> the S channel of HSV.
+  detection_mode: ""
+
+  # The detector's inside-black/surround-white gate. Keep it on; see
+  # rig_example.yaml for the measured reason (275/294 vs 48/294 detections on
+  # this dataset). With two cameras needing a budget, it matters even more.
+  edge_check: true
+
+  # Radial distortion order: k = 1 + d1*r^2 + d2*r^4 (+ d3*r^6 + d4*r^8 if
+  # raised). The .dwecal format stores exactly k1 and k2, so n_d > 2 (or
+  # non-zero d3/d4) still calibrates and writes the YAMLs but skips the dwecal
+  # with an explicit message.
+  n_d: 2
+
+# Numeric detector knobs. 0 means "leave the library default", which is what
+# this dataset needs. Each maps to a DISC_* environment variable read by the
+# vendored CTargetDetector.cpp; the node applies them before the first
+# detection. `probe` and `edge_stats` are debug output.
+detector:
+  size_threshold_px2: 0
+  dist_threshold_px: 0
+  max_candidates: 0
+  edge_contrast: 0
+  edge_inner_uniformity: 0
+  edge_outer_uniformity: 0
+  probe: false
+  edge_stats: false
+
+performance:
+  # Sparse (Tier 2) uncertainty accumulation: ~9 s per 100-frame camera solve,
+  # memory linear in frames. Do not turn this off for a real budget -- the
+  # dense path is O(N^3) and was measured at ~13 GB for 275 frames.
+  sparse_info: true
+  # Only consulted when sparse_info is false.
+  block_cov: false
+  # SPARSE_SCHUR for the joint refine.
+  sparse_schur: true
+  # Diagnostic dumps: 17-digit sigmas and the stage timing table.
+  unc_dump: false
+  time: false
+  # OpenMP threads for the detector's covariance loop; 0 = OpenMP default.
+  # Measured on the calibration_set_big replay: the per-contour parallel region
+  # is too small to pay for a team, and 12 threads spent ~9 cores spinning while
+  # detecting *fewer* frames than one thread. Keep this at 1 unless the
+  # detector changes; the limit is applied on the worker thread.
+  detector_threads: 1
+  # Ceres threads for both the mono solves and the joint refine.
+  ceres_threads: 1
+  # OpenCV's internal thread pool, for decode and rectification.
+  opencv_threads: 1
+  # Linux nice value for the single detection worker, [-20, 19].
+  nice: 0
+  # Threads decoding images for the dedicated image callback queue. Detection
+  # itself stays single-threaded.
+  async_spinner_threads: 1
+  # Decode (and drop) frames while the solve runs. Off: the solve is CPU-bound
+  # and the queue would evict them anyway.
+  collect_during_solve: false
+
+solve:
+  # Both-camera goals only. Refine both intrinsic sets and every board pose
+  # together, with the config extrinsic held bit-constant. Circle boards only.
+  joint_refine: true
+  # If the joint solve fails, keep the mono results, log the reason and continue
+  # (joint_refined: false) instead of failing the goal.
+  joint_refine_fallback: true
+
+frames:
+  # ACCEPTED frames PER CAMERA. The goal solves as soon as both cameras reach
+  # it. This is a ceiling, not a requirement: when the collection window below
+  # ends first, both cameras are solved from whatever each accepted, and only a
+  # camera below the calibrator's floor (6 for this board) fails.
+  budget: 300
+
+  # Stop collecting after this long and solve with what has arrived. Per
+  # attempt, and per goal: a both-mode collection needs roughly twice the wall
+  # time of a mono goal at the same feed rate. 900 s is sized for a throttled
+  # test feed; a real 30 Hz rig fills both budgets in seconds. A short
+  # collection yields a smaller calibration (and weaker uncertainties), not a
+  # failed goal.
+  max_duration_s: 150.0
+
+  # Frame de-duplication (the pose-diversity gate). A detected frame is a
+  # duplicate when its pose signature is closer than diversity_threshold to one
+  # already accepted. The signature is
+  #   (cx/W, cy/H, theta/pi, log2(sqrt(lambda1)/W), sqrt(lambda2/lambda1))
+  # -- board centroid, in-plane rotation, log scale and foreshortening aspect --
+  # and the distance is the RMS over those five normalised values, so 0.035
+  # means "each component differs by ~3.5%", at any resolution.
+  #
+  # Raise it to demand more varied poses: more frames are rejected as
+  # duplicates, the budget takes longer to fill, and the focal length and
+  # distortion are better constrained. Lower it -- or set diversity_gate: false
+  # -- to accept near-identical frames, which is what a hand-held board seen
+  # from one spot produces; the solve then reports a beautiful reprojection
+  # error while fx and d1 are barely constrained. `frames_duplicate` in the
+  # feedback counts the rejections, and each one is logged with its nearest
+  # accepted distance and this threshold. rig_example.yaml has the measured
+  # reasoning behind 0.035 (54 contiguous frames landed 7.30 px from a
+  # 137-frame reference; 55 spread ones were 3.59 px off).
+  diversity_gate: true
+  diversity_threshold: 0.035
+
+  # Share of the frames BOTH cameras accepted that are held back from both
+  # fits. The holdout is chosen once, by stamp, and forced into both cameras --
+  # otherwise a frame one camera fitted could be scored by the other camera's
+  # check, which is the independence the check exists to provide.
+  holdout_fraction: 0.15
+
+check:
+  enabled: true
+
+  # Held-out cross-camera reprojection RMS limit, evaluated per camera against
+  # the OTHER camera's final intrinsics. The both-mode goal passes only when
+  # both cameras pass. Same measurement and same 4.0 px reasoning as
+  # rig_example.yaml; tune it per rig.
+  max_rms_px: 4.0
+
+  # Collection attempts after a failed check. A retry re-collects the whole
+  # rig, so discocal_raw/<camera>/attempt_N stays aligned across cameras.
+  retries: 1
+
+cameras:
+  left:
+    topic: /ikan/explore3d/left/compressed
+    transport: compressed
+    frame_id: explore3d
+    # Both cameras are solved by this node in both mode.
+    source: calibrate
+
+  right:
+    topic: /ikan/explore3d/right/compressed
+    transport: compressed
+    frame_id: explore3d
+    source: calibrate
+
+# Fixed extrinsic: the pose of `child` in `parent`'s frame,
+#
+#     p_parent = R * p_child + t
+#
+# copied from calibration_set_big/extrinsic_result/relative_camera_poses.txt
+# (left = camera0, right = camera1). rotation is a Rodrigues vector in radians,
+# not Euler angles; translation is metres. See rig_example.yaml for the libCalib
+# JSON inversion warning. This value is never estimated or mutated.
+extrinsic:
+  parent: left
+  child: right
+  rotation:
+    rx: 0.005870
+    ry: 0.013980
+    rz: -0.013437
+  translation:
+    x: 0.099966
+    y: -0.001510
+    z: 0.006461
+
+output:
+  # One timestamped subdirectory per run:
+  #   <directory>/calibration_YYYYmmdd_HHMMSS/
+  # Nothing in an existing run directory is overwritten; a second run in the
+  # same second gets a _1 suffix.
+  directory: /output
+
+dwecal:
+  # Written only when both cameras produce finite, positive intrinsics and the
+  # distortion is representable (n_d <= 2, d3 = d4 = 0).
+  enabled: true
+
+  # The format's resolution byte is an enum; only these four are valid:
+  #   1600x1200 UXGA (byte 0), 1280x720 HD (1), 800x600 SVGA (2), 640x480 VGA (3)
+  output_width: 1600
+  output_height: 1200
+
+  basename: calibration.dwecal
+
+  # The file does not record which map is which camera. Refuse to write when
+  # camera1 is not physically to the right of camera0 (positive x of its origin
+  # in camera0's frame), because that would silently mirror disparity.
+  require_camera1_right: true

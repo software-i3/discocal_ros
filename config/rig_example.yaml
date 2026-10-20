@@ -1,0 +1,272 @@
+# discocal_ros rig configuration -- EXAMPLE.
+#
+# The values below are not invented: they are the measured board, the mono
+# intrinsics solved offline for `calibration_set_big`, and the stereo extrinsic
+# from `calibration_set_big/extrinsic_result`. So this file is runnable as-is
+# against that dataset, which is what the package's own verification uses:
+#
+#   rosrun discocal_ros publish_image_dir.py --dir calibration_set_big
+#   rosrun discocal_ros discocal_ros_node _rig_config:=<this file>
+#   # then send a calibrate_camera goal for "left"
+#
+# Replace every number below with your own rig's before using it for real.
+
+board:
+  # "circle" uses the moment/conic path (Calibrator::calibrate mode 0);
+  # "square" uses the corner path (mode 2).
+  type: circle
+
+  # Measured from the frames of calibration_set_big: a symmetric lattice, 7 dots
+  # along a row and 5 along a column, ~364 px^2 per dot at the closest approach
+  # -- comfortably above the detector's hard-coded 100 px^2 size gate, so the
+  # stock thresholds work and no DISC_SIZE_THRESHOLD override is needed.
+  n_x: 7
+  n_y: 5
+  radius: 0.0145        # metres; 29 mm dot diameter / 2
+  distance: 0.039       # metres; centre-to-centre pitch
+  asymmetric: false
+
+  # "" -> BGR2GRAY; "saturation" -> the S channel of HSV. This is what the
+  # offline runs used on this dataset. Passed straight to
+  # TargetDetector::preprocessing.
+  detection_mode: ""
+
+  # The detector's inside-black/surround-white appearance gate on each candidate
+  # blob (DISC_EDGE_CHECK in the vendored sources).
+  #
+  # Leave this on. With it off, the detector caps its candidate list at
+  # n_x*n_y blobs taken in DESCENDING AREA order, so two static dark objects in
+  # the room win seats and evict real dots -- measured on this dataset, one of
+  # them sits at (188, 427) with a fixed 584 px^2 area and acts as a depth
+  # switch, evicting a dot whenever the board is far enough for the real dots to
+  # be smaller. The cost is almost everything: 48/294 (left) and 56/294 (right)
+  # frames detect with the gate off, 275/294 and 279/294 with it on, and the
+  # frames that already worked give the same calibration either way.
+  #
+  # For this node that difference is the difference between working and not: at
+  # 5-16% detection the budget never fills before frames.max_duration_s, and
+  # since the two cameras fail independently almost no accepted frame finds a
+  # partner for the cross-camera check.
+  #
+  # On is the opposite of the vendored library's default, which is off so that
+  # stock offline runs stay byte-identical to earlier measurements. This node has
+  # no such history. Set false for stock behaviour.
+  edge_check: true
+
+  # Radial distortion order actually estimated. The model is
+  #     k = 1 + d1*r^2 + d2*r^4 (+ d3*r^6 + d4*r^8 if n_d is raised)
+  # applied to the normalised point. There is no tangential term anywhere in
+  # discocal, so p1 = p2 = 0 in the emitted camera_info, always.
+  #
+  # n_d = 2 means exactly d1 and d2 are solved; the calibrator's
+  # `n_skip_cols = 4 - n_d` leaves d3/d4 at zero. Leave it at 2 unless you have
+  # a reason to widen the model.
+  n_d: 2
+
+frames:
+  # Accepted frames to collect before the calibration runs. This is a CEILING,
+  # not a requirement: if max_duration_s below is reached first, the solve runs
+  # on whatever was accepted, and only a count below the calibrator's floor
+  # (6 for this board: max(5, 4 + n_d)) is refused.
+  #
+  # The solve's uncertainty block is O(N^3) (measured: wall
+  # ~= 1.03e-4*N^3 + 3.7e-3*N^2 + 0.09*N seconds), so 50 frames is about
+  # 25-30 s. 275 frames would be ~50 min and ~13 GB.
+  budget: 50
+
+  # Stop collecting after this long and calibrate from what has arrived. This
+  # bounds how long a goal whose board never appears can hold the node's slot;
+  # it does not fail the goal. With zero usable frames the solve fails on its
+  # own ("no frames were decoded" / below the floor), and that failure is not
+  # retried, because a retry would just burn another window.
+  #
+  # It has to be generous enough for the budget to fill, which is tighter than
+  # it sounds, because the detector is the bottleneck and not the feed: two
+  # full-rate frames/s is about what one worker thread sustains on this dataset
+  # (see the note on budget above), and the diversity gate then accepts only
+  # about a third of what detects. Measured on this rig at a 1 Hz feed, filling
+  # 50 accepted frames took 129 s and 154 s on the two attempts of one goal.
+  # 120 s -- this file's earlier value -- is under both, so the goal died
+  # holding 35 of its 50 frames and never reached the solve at all.
+  #
+  # A real rig publishes at ~30 Hz, where the same 50 frames arrive in a couple
+  # of seconds and this value is pure safety margin. Set it by the slower of
+  # "how long a solve should be allowed to take" and "how long my feed needs".
+  max_duration_s: 300.0
+
+  # Pose-diversity gate. Without it, "the first N frames" reproduces discocal's
+  # worst case: on this very rig, 54 *contiguous* frames land 7.30 px from a
+  # 137-frame reference while 55 *spread* ones are 3.59 px off, because
+  # contiguous frames lack pose diversity and fx comes out low with d1 too
+  # negative. The gate is the streaming analogue of the stride subsets that
+  # measured that.
+  diversity_gate: true
+
+  # A frame is a duplicate when its pose signature is closer than this to one
+  # already accepted. The signature is
+  #   (cx/W, cy/H, theta/pi, log2(sqrt(lambda1)/W), sqrt(lambda2/lambda1))
+  # -- board centroid, in-plane rotation, log scale and foreshortening aspect.
+  # Every component is normalised, so the distance is a fraction of the whole
+  # image and 0.035 means "each component differs by ~3.5%" at any resolution.
+  # Raise it to demand more variety, lower it to accept more frames.
+  diversity_threshold: 0.035
+
+  # Share of accepted frames held back from the solve and used only for the
+  # cross-camera check. Fresh poses are solved for them with the intrinsics
+  # frozen, so the check is not measured on the fitted frames -- the reported
+  # reprojection error is, which is why it flatters small subsets.
+  holdout_fraction: 0.2
+
+check:
+  enabled: true
+
+  # Held-out cross-camera reprojection RMS, in pixels.
+  #
+  # How it works. When a calibration is about to run, `holdout_fraction` of the
+  # accepted frames are set aside and never fitted. For those frames alone the
+  # calibrated camera's board pose is re-solved with the just-calibrated
+  # intrinsics held constant (Calibrator::update_Es -- upstream's
+  # `fix_intrinsic`). The nominal board is then placed at that pose, pushed
+  # through the fixed extrinsic into the other camera, and projected with the
+  # other camera's intrinsics. The residual against what that camera actually
+  # detected is the number below. Nothing in that chain is fitted here, so a bad
+  # intrinsic set or a wrong extrinsic shows up and the fit cannot hide it.
+  #
+  # The comparison is a true RMS over every dot of every held-out pair, in
+  # pixels of the *other* camera's image. A pair whose own pose fails to
+  # reproduce its own camera's detections within 5 px is dropped as a failed
+  # solve rather than counted here.
+  #
+  # --- where 4.0 comes from, measured rather than guessed -------------------
+  #
+  # The floor for this rig is 1.4467 px. That is not the node's number: it is
+  # what you get by taking the reference mono intrinsics that upstream's own
+  # stereo run was built from (fx 367.451) and pushing their held-out board
+  # poses through this same fixed extrinsic, with nothing fitted at all. So
+  # 1.0 px -- which this file shipped until the check was actually run -- is
+  # below the rig's own floor and no calibration of any quality could ever pass
+  # it.
+  #
+  # Against that floor, three intrinsic sets, each scored over the same 40
+  # held-out frame pairs and each solving its own pose (1400 dots):
+  #
+  #   intrinsics                 own RMS    cross RMS
+  #   reference, fx 367.451      0.1424 px   1.4467 px   <- the floor
+  #   node solve, fx 367.006     0.1474 px   2.8074 px
+  #   node solve, fx 371.178     0.1583 px   5.0731 px
+  #
+  # Read the first two columns together: they are the argument for this check
+  # existing at all. A 3.5x spread in cross-camera error moves the own-camera
+  # reprojection error by 11%, so the number the calibration reports about
+  # itself cannot tell a good intrinsic set from a bad one. The cross-camera
+  # residual can, and it is also what catches a wrong extrinsic: the same
+  # measurement with the transform read the other way round (R|t instead of
+  # R^T|-R^T t) is 12.66 px, and every other reading tried is worse.
+  #
+  # So the usable band is (floor 1.45, node's own good solves ~2.8, nearest
+  # wrong-extrinsic reading 12.66). 4.0 px sits inside it, above a solve this
+  # node actually produced on a good run and far below any wrong geometry. It
+  # is also under a third of a dot pitch (~12-21 px at this scale), which is
+  # the principled place to draw it: past one pitch you are not looking at
+  # imprecision, you are looking at mismatched correspondences or a wrong
+  # transform, and no threshold tuning helps.
+  #
+  # For your own rig: run once, read the cross RMS off a calibration you
+  # already trust, and set this at roughly 3x it. Watch that it stays well
+  # under one dot pitch in pixels.
+  #
+  # This is the knob most likely to need moving. Too tight and a good solve is
+  # rejected and retried (or refused outright); too loose and the check stops
+  # being a fallback trigger, which is the job you gave it.
+  max_rms_px: 4.0
+
+  # Collection attempts after a failed check. 1 means "report, retry once".
+  retries: 1
+
+performance:
+  # OpenMP threads for the detector's covariance loop; 0 = OpenMP default.
+  #
+  # Keep this at 1. On this dataset the per-contour parallel region is too small
+  # to pay for a team: the OpenMP default (12 here) spent ~9 cores spinning while
+  # detecting no more frames than one thread, so the same calibration cost 945%
+  # of a core instead of ~60% with identical output. The limit is applied on the
+  # detection worker thread, because OpenMP's nthreads-var is per-thread.
+  #
+  # config/rig_example_both.yaml shows the rest of the performance knobs
+  # (sparse_info, ceres_threads, opencv_threads, nice, ...); their defaults are
+  # what this mono regression uses.
+  detector_threads: 1
+
+cameras:
+  left:
+    topic: /ikan/explore3d/left/compressed
+    # compressed (sensor_msgs/CompressedImage) or raw (sensor_msgs/Image).
+    # The real rig publishes CompressedImage on both sides.
+    transport: compressed
+    frame_id: explore3d
+    # calibrate -> solved by this node; file -> taken from `intrinsics` below.
+    source: calibrate
+
+  right:
+    topic: /ikan/explore3d/right/compressed
+    transport: compressed
+    frame_id: explore3d
+    source: file
+
+    # The right camera's mono solve on calibration_set_big, so the cross-camera
+    # check has something to project with when "left" is the camera being
+    # calibrated. These are the numbers libCalib JSON consumers get as
+    # f * 1, f * ar, cx, cy, k1, k2 -- see the note on the distortion model above
+    # for why p1/p2/k3 are absent.
+    intrinsics:
+      fx: 360.046
+      fy: 360.249
+      cx: 403.068
+      cy: 322.38
+      skew: -0.976495
+      d1: -0.161846
+      d2: 0.0196512
+      d3: 0.0
+      d4: 0.0
+
+# Fixed extrinsic -- NEVER estimated by this node. This is the pose of `child`
+# in `parent`'s frame:
+#
+#     p_parent = R * p_child + t          (t = child's origin in parent's frame)
+#
+# The values are the camera0 -> camera1 row of
+# calibration_set_big/extrinsic_result/relative_camera_poses.txt, which discocal
+# writes as "Relative poses described in camera0 coordinates (p_0 = T_i^0 p_i)"
+# -- the same direction this file wants, with left as camera0. So they copy
+# across as they are.
+#
+# WARNING: the libCalib JSON that axis_grasp consumes uses OpenCV
+# stereoCalibrate's (R, T), which maps the OTHER way (`p_1 = R * p_0 + T`).
+# Copying those numbers in needs an inversion:
+#     R_here = R_json^T,   t_here = -R_json^T * T_json
+#
+# rotation is a Rodrigues rotation VECTOR in RADIANS (axis-angle, `w`), applied
+# as R = exp(w^). It is not an Euler triple. Both discocal's own se3.rot and the
+# libCalib JSON's transform.rotation are rotation vectors, so those numbers copy
+# across unmodified too. This is not a formality: the near-degenerate stereo
+# solution in extrinsic_result_fullopt has rz = 3.127, where an Euler reading
+# gives a completely different rotation rather than a slightly different one.
+#
+# translation is in metres.
+extrinsic:
+  parent: left
+  child: right
+  rotation:
+    rx: 0.005870
+    ry: 0.013980
+    rz: -0.013437
+  translation:
+    x: 0.099966
+    y: -0.001510
+    z: 0.006461
+
+output:
+  # camera_info YAML is written here as <directory>/<camera>_camera_info.yaml,
+  # and the library's own raw results under <directory>/discocal_raw/. Overridden
+  # by the ~output_dir parameter; the directory is created if needed.
+  directory: /tmp/discocal_ros

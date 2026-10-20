@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<package format="2">
+    <name>discocal_ros</name>
+    <version>0.1.0</version>
+    <description>
+        ROS1 wrapper around the discocal circular-pattern camera calibrator:
+        subscribes to an image feed, detects the calibration board, accumulates
+        frames under a pose-diversity gate, runs a mono calibration, and returns
+        the intrinsics through an action. Verifies the result with a held-out
+        cross-camera reprojection check against a fixed extrinsic.
+    </description>
+    <maintainer email="patuan07@users.noreply.github.com">patuan07</maintainer>
+
+    <!--
+        The package as a whole is bound by the vendored library's licence.
+        discocal is CC BY-NC-SA 4.0: non-commercial, ShareAlike, and its README
+        states it is protected by a patent. ShareAlike is why this package cannot
+        be relicensed as Proprietary. See THIRD_PARTY_NOTICES.md.
+    -->
+    <license>CC-BY-NC-SA-4.0</license>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <build_depend>message_generation</build_depend>
+    <exec_depend>message_runtime</exec_depend>
+
+    <depend>roscpp</depend>
+    <depend>std_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>cv_bridge</depend>
+    <depend>actionlib</depend>
+    <depend>actionlib_msgs</depend>
+
+    <!-- The vendored library needs all four; none comes in through catkin. -->
+    <depend>libopencv-dev</depend>
+    <depend>libeigen3-dev</depend>
+    <depend>libceres-dev</depend>
+    <depend>libgoogle-glog-dev</depend>
+
+    <!-- The vendored utils.h includes <yaml-cpp/yaml.h>, and rig_config.cpp
+         parses the rig file with it. Not a catkin dependency, and not pulled in
+         by any of the above. -->
+    <depend>libyaml-cpp-dev</depend>
+
+    <export>
+    </export>
+</package>

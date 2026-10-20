@@ -1,0 +1,21 @@
+<launch>
+    <!--
+        discocal_ros: subscribes to one or two image feeds, detects the board,
+        and calibrates one camera or both (goal.camera: left/right/both) per
+        action goal.
+
+        The board geometry, the frame policy, the fixed extrinsic and the
+        per-camera source all live in the rig YAML; see config/rig_example.yaml.
+        Nothing here can override them except output_dir, which is the one thing
+        that differs per machine.
+    -->
+
+    <arg name="rig_config" default="$(find discocal_ros)/config/rig_example.yaml"/>
+    <arg name="output_dir" default="/tmp/discocal_ros"/>
+
+    <!-- The action server is ~/calibrate_camera, i.e. /discocal_ros/calibrate_camera. -->
+    <node name="discocal_ros" pkg="discocal_ros" type="discocal_ros_node" output="screen">
+        <param name="rig_config" value="$(arg rig_config)"/>
+        <param name="output_dir" value="$(arg output_dir)"/>
+    </node>
+</launch>
