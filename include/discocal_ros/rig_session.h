@@ -50,6 +50,11 @@ struct RigSessionResult {
     std::string message;
     int attempts = 0;
 
+    // "image" or "external", from rig.solve.pose_source. In external mode the
+    // joint refinement is not applicable and is skipped; the per-camera
+    // diagnostics in CameraOutcome::result describe the matching instead.
+    std::string pose_source = "image";
+
     bool joint_refined = false;
     double joint_fit_seconds = 0.0;
 

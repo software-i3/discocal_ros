@@ -6,6 +6,8 @@
 #include <sstream>
 
 #include "discocal_ros/camera_info_writer.h"
+#include "discocal_ros/external_points.h"
+#include "discocal_ros/known_pose_solver.h"
 
 // The vendored calibrator and its Lie-algebra helpers. Both headers do
 // `using namespace std;` at global scope, so they stay in this translation unit.
@@ -127,6 +129,58 @@ bool CalibrateSession::on_detection(const BoardFrame& frame) {
         return budget_reached();
     }
 
+    // External mode: a frame without a usable pose is not collectable at all.
+    // This gate runs before the diversity gate so an unpaired detection neither
+    // consumes budget nor pollutes the accepted signatures.
+    if (rig_.solve.pose_source == "external") {
+        const std::size_t expected =
+            static_cast<std::size_t>(rig_.board.n_x) * static_cast<std::size_t>(rig_.board.n_y);
+
+        if (!frame.external.present) {
+            ++stats_.pose_missing;
+            last_decision_ = "no external pose for this stamp";
+            if (!frame.external.error.empty()) last_decision_ += ": " + frame.external.error;
+            return budget_reached();
+        }
+
+        const CameraConfig* camera = rig_.camera(camera_);
+        const std::string expected_frame =
+            (camera != NULL && !camera->point_pose_frame_id.empty())
+                ? camera->point_pose_frame_id
+                : rig_.external.expected_frame_id;
+
+        std::string invalid;
+        std::ostringstream oss;
+        if (frame.shapes.size() != expected) {
+            oss << "detector returned " << frame.shapes.size() << " dot(s), the board has "
+                << expected;
+            invalid = oss.str();
+        } else if (frame.external.points.size() != expected) {
+            oss << "external pose has " << frame.external.points.size() << " point(s), the board has "
+                << expected;
+            invalid = oss.str();
+        } else if (!expected_frame.empty() && frame.external.frame_id != expected_frame) {
+            invalid = "external pose is in frame \"" + frame.external.frame_id +
+                      "\" but the expected frame is \"" + expected_frame + "\"";
+        } else {
+            for (std::size_t i = 0; i < frame.external.points.size(); ++i) {
+                const Eigen::Vector3d& p = frame.external.points[i];
+                if (!p.allFinite() || !(p.z() > 0.0)) {
+                    oss << "external point " << i
+                        << " is not a finite position in front of the camera";
+                    invalid = oss.str();
+                    break;
+                }
+            }
+        }
+
+        if (!invalid.empty()) {
+            ++stats_.pose_invalid;
+            last_decision_ = invalid;
+            return budget_reached();
+        }
+    }
+
     double nearest = -1.0;
     const GateDecision decision = gate_.consider(frame.shapes, &nearest);
 
@@ -165,7 +219,7 @@ void CalibrateSession::on_other_detection(const BoardFrame& frame) {
     // an entry a later accepted frame still needs.
     if (other_.find(frame.stamp_ns) != other_.end()) return;
 
-    other_[frame.stamp_ns] = frame.shapes;
+    other_[frame.stamp_ns] = frame;
     other_order_.push_back(frame.stamp_ns);
 
     // Bounded: an accepted frame and the other camera's frame for the same
@@ -309,6 +363,13 @@ SolveOutcome CalibrateSession::solve(const std::vector<std::int64_t>* forced_hol
         }
     }
 
+    // The external path shares every decision up to here -- which frames were
+    // accepted and which are held out -- and differs only in where the board
+    // pose comes from.
+    if (rig_.solve.pose_source == "external") {
+        return solve_external(fit_positions, holdout_positions, attempt);
+    }
+
     // --- solve --------------------------------------------------------------
     // The library opens <dir>/intrinsic_parameters.yaml unconditionally inside
     // calibrate(), so it needs a directory that exists. It is left there as a
@@ -386,9 +447,9 @@ SolveOutcome CalibrateSession::solve(const std::vector<std::int64_t>* forced_hol
         HeldOutFrame frame;
         frame.stamp_ns = source.stamp_ns;
         frame.own_shapes = source.shapes;
-        const std::map<std::int64_t, std::vector<::Shape> >::const_iterator other =
+        const std::map<std::int64_t, BoardFrame>::const_iterator other =
             other_.find(source.stamp_ns);
-        if (other != other_.end()) frame.other_shapes = other->second;
+        if (other != other_.end()) frame.other_shapes = other->second.shapes;
         out.holdout_frames.push_back(frame);
     }
     if (out.holdout_frames.empty() && out.holdout_reason.empty()) {
@@ -398,8 +459,304 @@ SolveOutcome CalibrateSession::solve(const std::vector<std::int64_t>* forced_hol
     return out;
 }
 
+SolveOutcome CalibrateSession::solve_external(const std::vector<int>& fit_positions,
+                                              const std::vector<int>& holdout_positions,
+                                              int attempt) {
+    // The external solver keeps no intermediate files, so there is no attempt
+    // subdirectory to name. The parameter stays for signature parity with the
+    // image path and for a future diagnostic dump.
+    (void)attempt;
+
+    SolveOutcome out;
+    out.pose_source = "external";
+    out.n_frames_heldout = static_cast<int>(holdout_positions.size());
+
+    const BoardConfig& board = rig_.board;
+    const std::size_t expected =
+        static_cast<std::size_t>(board.n_x) * static_cast<std::size_t>(board.n_y);
+
+    // Sorted by stamp so the matcher's temporal-continuity preference walks the
+    // collection in time, not in arrival order. A queued feed can deliver a
+    // frame late, and a flip decision made against a future frame is noise.
+    std::vector<int> ordered = fit_positions;
+    std::sort(ordered.begin(), ordered.end(), [this](int a, int b) {
+        return accepted_[a].stamp_ns < accepted_[b].stamp_ns;
+    });
+
+    std::vector<KnownPoseFrame> inputs;
+    inputs.reserve(ordered.size());
+    int skipped = 0;
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        const BoardFrame& source = accepted_[ordered[i]];
+        if (!source.external.present || source.external.points.size() != expected ||
+            source.shapes.size() != expected) {
+            ++skipped;
+            continue;
+        }
+        KnownPoseFrame input;
+        input.stamp_ns = source.stamp_ns;
+        input.shapes = source.shapes;
+        input.points = source.external.points;
+        inputs.push_back(input);
+    }
+    out.rejected_external_frames = skipped;
+
+    if (static_cast<int>(inputs.size()) < min_fit_frames()) {
+        std::ostringstream oss;
+        oss << "only " << inputs.size()
+            << " fit frame(s) carried a usable external pose; a " << board.type
+            << " board with n_d=" << board.n_d << " cannot be solved from fewer than "
+            << min_fit_frames();
+        out.message = oss.str();
+        return out;
+    }
+
+    KnownPoseOptions options;
+    options.image_width = width_;
+    options.image_height = height_;
+    options.projection_mode = calibration_mode(board.type);
+    options.min_frames = min_fit_frames();
+    options.ceres_threads = rig_.performance.ceres_threads;
+    options.external = rig_.external;
+
+    ::Params initial;
+    const ::Params* initial_ptr = NULL;
+    const CameraConfig* config = rig_.camera(camera_);
+    if (config != NULL && config->has_intrinsics) {
+        initial = config->intrinsics;
+        initial_ptr = &initial;
+    }
+
+    KnownPoseSolver solver(board, options);
+    KnownPoseResult result;
+    solver.solve(inputs, initial_ptr, &result);
+
+    out.params = result.params;
+    out.fit_seconds = result.fit_seconds;
+    out.matched_frames = result.matched_frames;
+    out.ambiguous_frames = result.ambiguous_frames;
+    out.rejected_external_frames += result.rejected_frames;
+    out.mean_rigidity_rms_m = result.mean_rigidity_rms_m;
+    out.initialization = result.initialization;
+    out.n_frames = result.matched_frames;
+    out.reprojection_error = result.reprojection_error_px;
+    out.message = result.message;
+
+    if (!result.ok) {
+        return out;
+    }
+    out.ok = true;
+
+    // The fit set in the solver's (chronological) order.
+    out.fit_stamps.reserve(static_cast<std::size_t>(result.matched_frames));
+    out.fit_shapes.reserve(static_cast<std::size_t>(result.matched_frames));
+    out.fit_poses.reserve(static_cast<std::size_t>(result.matched_frames));
+    for (std::size_t i = 0; i < inputs.size() && i < result.frames.size(); ++i) {
+        if (!result.frames[i].used) continue;
+        out.fit_stamps.push_back(inputs[i].stamp_ns);
+        out.fit_shapes.push_back(inputs[i].shapes);
+        out.fit_poses.push_back(result.frames[i].match.T);
+    }
+
+    // --- held-out frames ----------------------------------------------------
+    out.holdout_frames.reserve(holdout_positions.size());
+    for (std::size_t i = 0; i < holdout_positions.size(); ++i) {
+        const BoardFrame& source = accepted_[holdout_positions[i]];
+        HeldOutFrame frame;
+        frame.stamp_ns = source.stamp_ns;
+        frame.own_shapes = source.shapes;
+        frame.has_external = source.external.present;
+        frame.own_external_points = source.external.points;
+
+        const std::map<std::int64_t, BoardFrame>::const_iterator other =
+            other_.find(source.stamp_ns);
+        if (other != other_.end()) {
+            frame.other_shapes = other->second.shapes;
+            frame.other_has_external = other->second.external.present;
+            frame.other_external_points = other->second.external.points;
+        }
+        out.holdout_frames.push_back(frame);
+    }
+    if (out.holdout_frames.empty() && out.holdout_reason.empty()) {
+        out.holdout_reason = "no frame was held out to score";
+    }
+
+    return out;
+}
+
+CheckResult CalibrateSession::evaluate_external(const SolveOutcome& outcome,
+                                                const ::Params& final_params) const {
+    CheckResult check;
+    if (!outcome.ok) {
+        check.reason = outcome.message.empty() ? "the solve produced no usable intrinsics"
+                                               : outcome.message;
+        return check;
+    }
+    if (outcome.holdout_frames.empty()) {
+        check.reason = outcome.holdout_reason.empty() ? "no frame was held out to score"
+                                                      : outcome.holdout_reason;
+        return check;
+    }
+    if (!check_configured_) {
+        check.reason = check_unavailable_reason_;
+        return check;
+    }
+    if (!have_other_params_) {
+        check.reason = "the intrinsics of \"" + other_camera_ + "\" are not known";
+        return check;
+    }
+
+    const BoardConfig& board = rig_.board;
+    const int mode = calibration_mode(board.type);
+    const std::vector<Eigen::Vector3d> lattice = board_lattice(board);
+    if (lattice.empty()) {
+        check.reason = "board lattice is empty";
+        return check;
+    }
+
+    BoardMatchOptions options;
+    options.max_rigidity_rms_m = rig_.external.max_rigidity_rms_m;
+    options.max_match_rms_px = rig_.external.max_match_rms_px;
+    options.min_match_margin_px = rig_.external.min_match_margin_px;
+    options.temporal_margin_px = rig_.external.temporal_margin_px;
+    options.allow_ambiguous = (rig_.external.ambiguous_policy == "use_best");
+    options.projection_mode = mode;
+
+    const std::vector<LatticeSymmetry> symmetries = lattice_symmetries(lattice);
+    const BoardProjector projector(board.n_d);
+
+    // Both cameras are matched independently with their final intrinsics. A
+    // match supplies the board pose AND the permutation; reordering both
+    // cameras' detections into nominal lattice order is what makes the existing
+    // cross-camera check applicable unchanged.
+    std::vector<HeldOutFrame> frames;
+    frames.reserve(outcome.holdout_frames.size());
+    int unusable = 0;
+
+    // Match in time order so the temporal-continuity preference behaves as it
+    // does in the solve. The holdout list is in collection order, which a
+    // queued feed does not guarantee to be chronological.
+    std::vector<const HeldOutFrame*> ordered;
+    ordered.reserve(outcome.holdout_frames.size());
+    for (std::size_t i = 0; i < outcome.holdout_frames.size(); ++i) {
+        ordered.push_back(&outcome.holdout_frames[i]);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const HeldOutFrame* a, const HeldOutFrame* b) {
+                  return a->stamp_ns < b->stamp_ns;
+              });
+
+    std::vector<int> previous_own;
+    std::vector<int> previous_other;
+
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        const HeldOutFrame& source = *ordered[i];
+        if (!source.has_external || !source.other_has_external) {
+            ++unusable;
+            continue;
+        }
+        if (source.own_shapes.size() != lattice.size() ||
+            source.other_shapes.size() != lattice.size() ||
+            source.own_external_points.size() != lattice.size() ||
+            source.other_external_points.size() != lattice.size()) {
+            ++unusable;
+            continue;
+        }
+
+        const BoardMatch own = match_board_pose(
+            lattice, source.own_external_points, source.own_shapes, final_params, board.radius,
+            projector, options, symmetries,
+            previous_own.empty() ? NULL : &previous_own);
+        if (!own.ok) {
+            ++unusable;
+            continue;
+        }
+
+        const BoardMatch other = match_board_pose(
+            lattice, source.other_external_points, source.other_shapes, other_params_,
+            board.radius, projector, options, symmetries,
+            previous_other.empty() ? NULL : &previous_other);
+        if (!other.ok) {
+            ++unusable;
+            continue;
+        }
+        previous_own = own.permutation;
+        previous_other = other.permutation;
+
+        HeldOutFrame frame;
+        frame.stamp_ns = source.stamp_ns;
+        frame.T = own.T;
+
+        // The own detections are already in the order the check wants: the
+        // matcher chose own.permutation precisely so that lattice[k] projects
+        // to source.own_shapes[k] through own.T. The other camera may have
+        // labeled the same board through a different symmetry, so align its
+        // observations by original label: the physical dot at own detector k
+        // is own.permutation[k], and the other detector index carrying that
+        // same label is its inverse image under other.permutation.
+        std::vector<int> other_index_by_label(source.other_shapes.size(), -1);
+        bool labels_align = true;
+        for (std::size_t j = 0; j < other.permutation.size(); ++j) {
+            const int label = other.permutation[j];
+            if (label < 0 || static_cast<std::size_t>(label) >= other_index_by_label.size()) {
+                labels_align = false;
+                break;
+            }
+            other_index_by_label[static_cast<std::size_t>(label)] = static_cast<int>(j);
+        }
+        if (!labels_align) {
+            ++unusable;
+            continue;
+        }
+
+        // Shape has no default constructor, so build the reordered vector by
+        // appending rather than resizing. A failed frame is discarded whole.
+        frame.own_shapes = source.own_shapes;
+        frame.other_shapes.clear();
+        frame.other_shapes.reserve(lattice.size());
+        for (std::size_t k = 0; k < lattice.size(); ++k) {
+            const int label = own.permutation[k];
+            if (label < 0 || static_cast<std::size_t>(label) >= other_index_by_label.size() ||
+                other_index_by_label[static_cast<std::size_t>(label)] < 0) {
+                labels_align = false;
+                break;
+            }
+            frame.other_shapes.push_back(source.other_shapes[static_cast<std::size_t>(
+                other_index_by_label[static_cast<std::size_t>(label)])]);
+        }
+        if (!labels_align) {
+            ++unusable;
+            continue;
+        }
+        frames.push_back(frame);
+    }
+
+    if (frames.empty()) {
+        std::ostringstream oss;
+        oss << "no held-out frame could be matched with its external pose (" << unusable
+            << " unusable of " << outcome.holdout_frames.size() << ")";
+        check.reason = oss.str();
+        return check;
+    }
+
+    check = run_cross_camera_check(frames, lattice, board.radius, board.n_d, mode, final_params,
+                                   other_params_, T_own_to_other_, rig_.check.max_rms_px);
+    if (!check.ran && unusable > 0 && !check.reason.empty()) {
+        std::ostringstream oss;
+        oss << check.reason << "; " << unusable
+            << " held-out frame(s) were also dropped before the check for an unusable external "
+               "match";
+        check.reason = oss.str();
+    }
+    return check;
+}
+
 CheckResult CalibrateSession::evaluate(const SolveOutcome& outcome,
                                        const ::Params& final_params) const {
+    if (rig_.solve.pose_source == "external") {
+        return evaluate_external(outcome, final_params);
+    }
+
     CheckResult check;
     if (!outcome.ok) {
         check.reason = outcome.message.empty() ? "the solve produced no usable intrinsics"
@@ -478,6 +835,11 @@ SessionResult CalibrateSession::finalize(bool allow_unchecked) {
     out.reprojection_error = solved.reprojection_error;
     out.fit_seconds = solved.fit_seconds;
     out.raw_output_directory = solved.raw_output_directory;
+    out.pose_source = solved.pose_source;
+    out.frames_matched = solved.matched_frames;
+    out.frames_ambiguous = solved.ambiguous_frames;
+    out.frames_rejected_external = solved.rejected_external_frames;
+    out.mean_rigidity_rms_m = solved.mean_rigidity_rms_m;
 
     if (!solved.ok) {
         out.message = solved.message;

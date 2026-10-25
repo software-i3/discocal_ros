@@ -25,6 +25,13 @@ uint32 budget
 # missing check is reported as an error rather than silently skipped.
 bool allow_unchecked
 
+# Board-pose source for this goal: "" keeps the rig config's solve.pose_source,
+# "image" forces the image-only path, "external" uses each camera's
+# point_pose_topic (geometry_msgs/PoseArray of dot positions in the camera
+# optical frame, indexed by original label). External mode still requires the
+# image feed for detection.
+string pose_source
+
 ---
 
 # --- result -----------------------------------------------------------------
@@ -105,6 +112,17 @@ string  run_directory
 string  dwecal_path           # "" when no .dwecal was written
 string  dwecal_sha256         # lowercase hex of dwecal_path; "" with it
 
+# Which board-pose source produced this result ("image" or "external").
+string  pose_source
+
+# External-mode match diagnostics, mirroring the first camera in a mono goal.
+# In both mode the counts are summed over cameras and mean_rigidity_rms_m is
+# the worst camera's. All are zero in image mode.
+uint32  frames_matched            # frames that entered the external-pose fit
+uint32  frames_ambiguous          # rejected: symmetry margin below the limit
+uint32  frames_rejected_external  # rejected for any external-pose reason
+float64 mean_rigidity_rms_m       # mean Kabsch residual of the measured dots
+
 ---
 
 # --- feedback ---------------------------------------------------------------
@@ -127,3 +145,8 @@ float32 progress              # accepted / budget, capped at 1.0
 # mirror the first camera.
 uint32 cameras_in_goal
 CameraProgress[] cameras
+
+# External-pose counters missing from CameraProgress's earlier fields. These
+# mirror the first camera in a both-mode goal and are zero in image mode.
+uint32 frames_pose_missing    # no usable pose sample for the frame's stamp
+uint32 frames_pose_invalid    # sample present but unusable for this frame

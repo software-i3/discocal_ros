@@ -64,3 +64,12 @@ float64 check_worst_pair_rms_px
 # Time spent in this camera's solve (mono, plus the joint stage's share is not
 # attributed here; see CalibrateCameraResult.joint_fit_seconds).
 float64 fit_seconds
+
+# Board-pose source for this camera ("image" or "external"). In external mode
+# the board pose is measured from point_pose_topic instead of estimated from
+# the image, and the fields below describe the label/symmetry matching.
+string  pose_source
+uint32  frames_matched            # frames that entered the external-pose fit
+uint32  frames_ambiguous          # rejected: symmetry margin below the limit
+uint32  frames_rejected_external  # rejected for any external-pose reason
+float64 mean_rigidity_rms_m       # mean Kabsch residual of the measured dots

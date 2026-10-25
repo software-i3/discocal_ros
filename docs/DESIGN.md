@@ -45,6 +45,8 @@ The policy lives in classes that have never heard of ROS:
 | `CrossCameraCheck` | Scoring held-out frames through the fixed extrinsic. |
 | `CalibrateSession` | Budget, holdout split, solve, evaluate, retry, verdict for one camera. |
 | `RigSession` | Both-camera orchestration: shared holdout, two mono solves, fixed-extrinsic joint refine, per-camera verdicts, artifact layout. |
+| `KnownPoseSolver` | External mode: symmetry matching, linear `K` bootstrap, and the fixed-pose `K`/`D` solve. |
+| `PoseBuffer` | External mode: stamp-sorted pose samples, exact/nearest/interpolated lookup. |
 | `generate_dwecal()` | The `.dwecal` bytes from two intrinsic sets plus the extrinsic. |
 | `PerformanceReport` | Stage wall/CPU timing, process CPU, RSS and thread sampling, written as YAML. |
 | `CameraInfoWriter` | The `camera_info` YAML. |
@@ -54,15 +56,21 @@ centroids plus a stamp -- and never a `cv::Mat`. The node decodes images and run
 the detector; nothing below `node.cpp` knows what an image is. The dwecal
 generator is similarly ROS-free: it takes plain arrays and returns bytes.
 
-The payoff is `test/test_core.cpp`: 35 tests that exercise config parsing and
-validation, the lattice ordering, the gate, the shared holdout, timestamped
-directory naming, the collection policy (a short feed above the solver's floor
-still calibrates), the `camera_info` layout and atomic writes, joint refine (the
-fixed extrinsic stays bit-identical), the dwecal generator (structure, refusals,
-golden land input, skew against `initUndistortRectifyMap`), and the check itself
--- including a synthetic rig where both cameras are generated from one known-good
-pose, so a correct projector must score ~0 and an inverted extrinsic must score
->10 px. None of that needs a roscore, a camera, or the dataset. The alternative
+The payoff is `test/test_core.cpp` (35 tests) and `test/test_external.cpp` (21
+tests). The core suite exercises config parsing and validation, the lattice
+ordering, the gate, the shared holdout, timestamped directory naming, the
+collection policy (a short feed above the solver's floor still calibrates), the
+`camera_info` layout and atomic writes, joint refine (the fixed extrinsic stays
+bit-identical), the dwecal generator (structure, refusals, golden land input,
+skew against `initUndistortRectifyMap`), and the check itself -- including a
+synthetic rig where both cameras are generated from one known-good pose, so a
+correct projector must score ~0 and an inverted extrinsic must score >10 px.
+The external suite exercises the lattice symmetries, the Kabsch fit, symmetry
+matching under flips and rotations, non-rigid rejection, the face-on square
+resolved by its labels, a 2x2 board matched by label, the pose buffer, external
+config parsing (including the mode-dependent grid floor), and the known-pose
+solve recovering synthetic `K`/`D` from measured point positions.
+None of that needs a roscore, a camera, or the dataset. The alternative
 -- policy tangled into the node -- is testable only by launching a graph and
 feeding it images, which is how you end up verifying calibration code by looking
 at log lines.
@@ -439,7 +447,7 @@ extrinsic and in `rig_calibration.yaml`; and `calibration.dwecal.sha256` is a
 per-run integrity record, not a cross-version golden. The rectification ROI
 search can move the low bits between OpenCV versions, so byte identity is only
 promised against the same OpenCV that wrote the file.
-
+:
 ---
 
 ## 8. Timing, CPU, and the `max_duration_s` window
@@ -552,6 +560,16 @@ pass; and the both-camera path was run end to end from a bag replay of
 `calibration_set_big` (the 294 unique pairs recorded twice into one bag,
 replayed once at 1 Hz, budget 100 per camera).
 
+Re-verified on 2026-10-21 in the same container, after the external path landed
+and the grid-size floor became mode-dependent: all **35 core tests** and all
+**21 external tests** pass (`catkin_make
+run_tests_discocal_ros`, 0 failures). The prebuilt gtest archives were removed
+from `/usr/lib/x86_64-linux-gnu` first, leaving only the headers and sources
+`libgtest-dev` ships on 18.04, to confirm that `catkin_add_gtest` builds gtest
+from `/usr/src/googletest` and that both suites link without `gtest_main`.
+External mode was exercised only by those synthetic tests -- not against the arm
+publisher (section 12).
+
 The final both-mode run (`calibration_20261018_172411`) passed on the first
 attempt:
 
@@ -639,3 +657,176 @@ A note on feedback: `publishFeedback` must also go to the active handle, not the
 server. A feedback message sent after a preemption would otherwise be attributed
 to the replacement goal and report the old goal's counters under the new goal's
 budget -- the same class of bug, visible only when two goals overlap.
+
+---
+
+## 12. External board-pose mode
+
+`solve.pose_source: external` replaces the per-frame board pose with a
+measurement: another node publishes each dot's position in the camera's optical
+frame, and the solver fits the pose rigidly from those points. The intrinsic
+model, the Ceres residual, the covariance weighting, the holdout and the
+cross-camera check are unchanged. This section is why the mode is shaped that
+way, and what it trades.
+
+### Why a measured pose changes the problem
+
+In the image path the board pose is unknown, so a focal-length error can be
+absorbed by moving the board along the optical axis. That is the structural
+reason section 5's own-camera reprojection error cannot judge intrinsics. With
+the dot positions measured independently, the pose becomes a 6-DoF *ordinary*
+problem per frame -- Kabsch on the nominal lattice against the measured points
+-- and the only free parameters left are `K` and `D`. The pose can no longer
+absorb a focal-length error, so the solve is much more constrained.
+
+The trade is that the measurement error is now in the model. The solver treats
+every dot position as exact. A *rigidly* wrong cloud -- arm forward-kinematics
+error, a static-TF error, a target-mounting offset -- is indistinguishable from
+an intrinsics change and is fitted by `K`/`D` without any residual signature.
+The rigidity gate catches a non-rigid or mislabeled cloud, not a rigidly wrong
+one. So external mode is not automatically more accurate than the image path; it
+is as accurate as the arm chain, and it needs an independent A/B (a classic
+calibration, or a run against a known-good reference) before it is trusted.
+
+A measured pose also relaxes the board-size floor. The image path requires at
+least 3 dots per side because the pose is inferred from the dots and a 2xN grid
+constrains its rotation about the long axis weakly. In external mode the pose is
+fitted from the measured positions, so 2 per side is accepted. The floor cannot
+go lower: `CircleGridFinder` requires a four-corner convex hull to order the
+dots, so a single row or column cannot be detected at all, and Kabsch needs three
+non-collinear points. `RigConfig::load` therefore applies `>= 3` for
+`pose_source: image` and `>= 2` for `external`; a goal that overrides the source
+back to `image` is refused if the board is below 3 per side.
+
+### The matching problem and its convention
+
+The arm-side publisher is blind to images. It knows each dot's original label
+and publishes positions in that order. The detector, however, returns the dot
+lattice in an order determined by the projected image, so the mapping from
+detector index to original label is one of the lattice's dihedral symmetries:
+4 for a rectangular grid (identity, 180-degree rotation, and the two flips), 8
+for a square one.
+
+The matcher enumerates those symmetries and uses one convention throughout:
+
+```
+permutation[k] = original label of the dot the detector returned at index k
+```
+
+For each candidate it fits `T` by Kabsch from `lattice[k]` to
+`external[permutation[k]]`, then projects `lattice[k]` through `T` with the same
+conic `BoardProjector` the calibrator uses and scores the result against
+detector dot `k`. A wrong symmetry pairs one dot's measured position with a
+different dot's pixel, so the labels normally select a unique candidate even for
+a fronto-parallel symmetric board. The candidate is rejected when the chosen
+score is above `max_match_rms_px`, or when it beats the runner-up by less than
+`min_match_margin_px` and the policy is `skip`.
+
+That also fixes what ambiguity means here. It is not "the board is face-on and
+symmetric" -- the labels carry the orientation. It is "the competing pairings
+project onto nearly the same pixels", which happens when the board is small,
+distant or strongly foreshortened, or when detector noise is comparable to the
+between-candidate separation. `temporal_margin_px` keeps the previous frame's
+permutation when it is within the margin of the best, so a borderline frame does
+not flicker between two labelings; continuity is a tie-breaker, not a licence to
+accept a candidate that fails the RMS gate.
+
+### Validation before intrinsics: rigidity RMS
+
+For any candidate symmetry, the residual of the optimal rigid fit is the same.
+Permuting the correspondences by a lattice isometry is just a change of the
+nominal frame; it cannot change how far the measured cloud is from *some* rigid
+copy of the lattice. So `max_rigidity_rms_m` measures the measurement itself --
+a wrong pose count, a non-rigid arm error, a target whose dots moved -- with no
+`K`/`D` involved, and it cannot be fooled by choosing a different symmetry.
+
+The gate does not catch a stale pose under motion: a board measured at the wrong
+stamp is still a rigid cloud, just at a different place. That is the time
+synchronization problem, below, and it is why the stamp is part of the contract.
+
+### Time synchronization
+
+The arm moves continuously, so the image stamp and the PoseArray stamp must
+describe the same instant. The buffer keeps samples sorted by `header.stamp`
+and serves exact matches, linear interpolation between two bracketing samples
+(per label), or the nearest sample inside `sync_tolerance_s`. A sample outside
+that window, or a gap larger than `max_gap_s`, is not used; the frame is counted
+as `pose_missing` rather than being solved with a stale pose.
+
+The error is first order in the velocity: a board moving at 0.1 m/s paired with
+a pose 20 ms stale is displaced by 2 mm, which is the size of the rigidity gate
+and well above the detector noise. The tolerance therefore has to cover image
+latency and publisher jitter, and should be much shorter than the arm's motion
+period.
+
+### The EM loop
+
+The first pass has no reliable intrinsics, so `K` is bootstrapped from the
+measured 3D points and the detected 2D centroids. With `p = (X, Y, Z)` in the
+camera frame, the pinhole model is linear in `(fx, skew, cx, fy, cy)`:
+
+```
+u = (fx X + skew Y + cx Z) / Z
+v = (fy Y + cy Z) / Z
+```
+
+No board pose or Zhang homography is involved -- this is the concrete gain from
+knowing the positions. The linear solve is used only as an initializer; it is
+not a substitute for the distortion model and is skipped when degenerate. The
+initial `d` comes from the config (or zero).
+
+The loop is then match -> solve `K`/`D` with every pose fixed -> rematch, until
+the used set and the permutations stop changing or `max_em_iterations` is
+reached. The fixed-pose functor builds the same `::Params`, calls the same conic
+projector, and whitens by the detector covariance exactly as the vendor
+residual does; only `d[0..n_d-1]` are free, and unused coefficients are frozen
+at zero. Because the poses do not move, this is a well-conditioned intrinsics
+problem, not the alternating pose/intrinsics problem of the image path.
+
+### Cross-camera check and joint refinement
+
+A both-camera goal keeps the shared holdout and the fixed extrinsic. For the
+check, each held-out frame is matched independently in both cameras with the
+final intrinsics, and the two detections are reordered by **original label**
+into nominal lattice order. The existing `run_cross_camera_check` then projects
+the own camera's fitted board pose through the extrinsic and scores the other
+camera's pixels. That makes the check sensitive to a wrong permutation, a
+mis-synchronized pose and a bad intrinsics set, not only to the last one.
+
+Joint refinement is skipped. A joint stage estimates shared board poses and
+both intrinsic sets; with the poses measured there are no shared free pose
+parameters, and with the extrinsic fixed the two intrinsics problems separate
+completely. Running it would either do nothing or silently re-estimate the
+measurements, so the node reports `joint_refined: false` and logs a warning.
+The two mono results are the answer.
+
+### Known failure modes
+
+- **Rigid measurement bias becomes intrinsics bias.** In particular, a depth
+  scale error from the arm chain looks like a focal-length change. Only an
+  independent calibration or a reference A/B can see it.
+- **Time-sync error under motion.** First-order in arm velocity; covered above.
+- **A wrong label convention that is geometrically symmetric.** The margin gate
+  is the defence, but a small or edge-on board can make two candidates tie;
+  `ambiguous_policy: skip` is the safer default.
+- **Covariance weighting models the wrong noise.** It whitens detector pixel
+  noise only. Point-position error is not in the covariance and, unlike pixel
+  noise, is correlated across the dots of a frame.
+- **Pose diversity is still required.** Perfect poses do not compensate for a
+  board that only ever appeared at one orientation and one distance; the
+  diversity gate still runs on the image signature, so the same collection
+  discipline applies as in the image path.
+
+### What is verified
+
+The matching convention, the symmetry enumeration, flip/rotation recovery, the
+non-rigid rejection, a fronto-parallel square board resolving uniquely by label,
+the pose buffer's exact/interpolated/nearest/tolerance behavior, config parsing,
+and a synthetic known-pose solve recovering intrinsics are covered by
+`test/test_external.cpp` on generated data. The suite was run on 2026-10-21 in
+the Melodic container: 21 tests, all passing, alongside the 35 core tests.
+
+Not verified: a live arm publisher, its actual latency and jitter, the label
+convention of the real target, and an A/B against a classic calibration on the
+same images. Until that exists, treat external mode as implemented and
+unit-tested, not as validated on hardware.

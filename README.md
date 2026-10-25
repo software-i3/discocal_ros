@@ -94,6 +94,17 @@ resolution. Start from one of the two examples -- their numbers are measured
 values for `calibration_set_big`, and every field carries a comment saying where
 its value came from.
 
+The external example (`config/rig_example_external.yaml`) does the same but
+takes each frame's board pose from a measured per-camera `PoseArray` instead of
+estimating it from the image (see the next section):
+
+```bash
+roslaunch discocal_ros discocal_ros.launch \
+    rig_config:=$(rospack find discocal_ros)/config/rig_example_external.yaml \
+    output_dir:=/tmp/discocal_ros
+rosrun discocal_ros calibrate_client.py --camera both --pose-source external
+```
+
 `calibrate_client.py` is the reference client: it prints live feedback and every
 result field, and exits non-zero unless every camera succeeded *and* every check
 passed, so it is usable from a build script. `--camera` accepts `left`, `right`
@@ -106,13 +117,129 @@ rosrun actionlib axclient.py /discocal_ros/calibrate_camera
 (`axclient.py` is in `actionlib`, not `actionlib_tools`, on Melodic.)
 
 `CalibrateCamera.action` is the full contract. The goal is `camera`, `budget`
-(0 = the config value) and `allow_unchecked`; feedback carries live collection
-counters, per camera for a both-mode goal; the result carries one
-`CameraCalibration` entry per camera (intrinsics, 1-sigma uncertainties,
-reprojection error, check measurement and verdict), plus the run directory and
-the `.dwecal` path and hash. In both mode the scalar result fields are zeroed --
-use `cameras[]` -- so a consumer that ignores the array cannot install one
-camera's numbers as the rig.
+(0 = the config value), `allow_unchecked` and `pose_source` (empty = the config
+value, `image` or `external`); feedback carries live collection counters, per
+camera for a both-mode goal, including how many frames had no usable external
+pose; the result carries one `CameraCalibration` entry per camera (intrinsics,
+1-sigma uncertainties, reprojection error, check measurement and verdict), plus
+the run directory and the `.dwecal` path and hash. In both mode the scalar
+result fields are zeroed -- use `cameras[]` -- so a consumer that ignores the
+array cannot install one camera's numbers as the rig.
+
+## Calibrating from measured board poses
+
+The default path estimates each frame's board pose from the detected dots while
+it solves `K` and `D`. With `solve.pose_source: external`, a second node
+publishes the target dots' positions in each camera's optical frame, and this
+node fits the board pose to those points rigidly. The reprojection model, the
+Ceres problem over `K`/`D`, the uncertainties and the cross-camera check are the
+same; only the source of the board pose changes.
+
+This is the mode to use when the target is carried by a calibrated robot arm and
+the arm's forward kinematics plus static TFs already give the dot positions. It
+does **not** make the calibration automatically better: errors in the measured
+positions are absorbed by `K` and `D` exactly as pose errors were before, and
+time-synchronization error under continuous motion is a new bias. It removes the
+unknown-pose direction from the problem, not the need for accurate geometry.
+
+### The point-pose contract
+
+Each `source: calibrate` camera gets a topic:
+
+```yaml
+cameras:
+  left:
+    point_pose_topic: /arm/calibration_target/left_points
+    point_pose_frame_id: left_optical
+```
+
+The topic is a `geometry_msgs/PoseArray`:
+
+| Field | Meaning |
+| --- | --- |
+| `header.stamp` | When the positions are valid. This is matched against the image stamp, not against the message's arrival time. |
+| `header.frame_id` | The camera's optical frame (z forward, x right, y down), i.e. the frame `K`/`D` project into. `point_pose_frame_id` checks it; empty disables the check. |
+| `poses[i]` | Position of the dot whose **original label** is `i`, in metres. Orientation is ignored. |
+
+The array must have exactly `n_x * n_y` poses. The publisher does not need to
+know how the board is mounted, but it must preserve each dot's original
+pre-assembly label: flipping or rotating the target permutes labels relative to
+the detector's own lattice walk, and the node resolves that per frame.
+
+Because the pose is measured rather than inferred from the pixels, external mode
+accepts a smaller board than the image path: 2 dots per side instead of 3. A
+single row or column is still refused -- the detector needs a four-corner hull
+to order the dots and Kabsch needs three non-collinear points -- so 2x2 is the
+smallest usable board. A smaller board means fewer dots per frame, so distortion
+(`board.n_d`) is informed by spatial coverage across frames rather than by dots
+within one frame; keep the arm moving if you calibrate `d1`/`d2`.
+
+### Labels, flips and matching
+
+The detector returns a rectangular dot lattice in an order it chooses; the
+physical board's orientation relative to that walk is one of the lattice's
+dihedral symmetries. For every frame the node enumerates those symmetries (4 for
+a rectangular grid, 8 for a square one), fits a rigid transform by Kabsch for
+each, and scores the candidate by projecting the nominal lattice through the
+fitted pose with the library's own conic projector. The candidate is accepted
+when:
+
+- the measured cloud is rigid to within `external.max_rigidity_rms_m` (this
+  residual is invariant under relabeling, so it validates the measurement with
+  no `K`/`D` involved);
+- the chosen candidate reprojects below `external.max_match_rms_px`;
+- it beats the runner-up by `external.min_match_margin_px`, unless
+  `external.ambiguous_policy: use_best` accepts it anyway. Ambiguity means the
+  competing pairings project onto nearly the same pixels -- a small, distant or
+  edge-on board -- not a face-on one: the labels normally make even a
+  fronto-parallel board unique.
+
+`external.temporal_margin_px` keeps the previous frame's permutation when it is
+within that margin of the best, so a borderline frame does not flip between
+labelings mid-sequence. Frames that fail are counted (`frames_ambiguous`,
+`frames_rejected_external`), not silently used.
+
+Matching and solving alternate (EM): match with the current `K`/`D`, solve
+`K`/`D` with the fitted poses fixed, rematch, repeat until the permutations stop
+changing (`external.max_em_iterations`). `K` is bootstrapped by a linear
+3D-to-2D solve from the known positions and the detected pixels
+(`use_dlt_initialization`), falling back to the config intrinsics when that
+system is degenerate.
+
+### Time synchronization
+
+The arm moves continuously, so an image at stamp `t` must be paired with the
+positions valid at `t`, not with the latest array:
+
+- a sample within `external.sync_tolerance_s` is used as-is;
+- with `interpolate: true`, two samples bracketing `t` and no more than
+  `external.max_gap_s` apart are interpolated per label;
+- otherwise the nearest sample inside the tolerance is used;
+- with no usable sample, the frame does not enter the solve and is counted in
+  feedback as `pose_missing` (or `pose_invalid` for a wrong count/frame/non-finite
+  point).
+
+A tolerance much longer than the arm's motion period lets a moving board be
+paired with the wrong pose, which biases the result. Tune it to image latency
+plus publisher jitter.
+
+### Both-camera mode and the check
+
+Both cameras are still solved in one goal, each from its own PoseArray, and the
+shared holdout and fixed extrinsic are unchanged. The cross-camera check is
+adapted rather than skipped: each held-out frame is matched independently in
+both cameras, both detections are reordered by **original label** into nominal
+lattice order, and the existing check projects one camera's pose through the
+fixed extrinsic and scores the other camera's pixels. That makes the check
+sensitive to a wrong permutation or a mis-synchronized pose as well as to bad
+intrinsics.
+
+Joint refinement is skipped with a warning and `joint_refined: false`: the
+board poses are measurements, not free parameters shared by the two mono
+problems, so there is nothing to refine jointly with the extrinsic fixed. The
+run is otherwise identical, and `rig_calibration.yaml` records per-camera
+`pose_source`, `frames_matched`, `frames_ambiguous`,
+`frames_rejected_external` and `mean_rigidity_rms_m`.
 
 ## Configuring for your rig
 
@@ -122,9 +249,11 @@ change for a new rig, in the order it will bite you:
 
 | Group | Change |
 | --- | --- |
-| `board` | `n_x`/`n_y`, `radius`, `distance` -- physical board measurements, and the one group whose errors look like a broken detector rather than a wrong config. `type` is `circle` (moment/conic path) or `square` (corner path). |
+| `board` | `n_x`/`n_y`, `radius`, `distance` -- physical board measurements, and the one group whose errors look like a broken detector rather than a wrong config. `type` is `circle` (moment/conic path) or `square` (corner path). The image path needs at least 3 per side; external mode needs 2 (see above). |
 | `cameras.*` | The real `topic`, `transport` (`compressed` or `raw`) and `frame_id`. |
 | `cameras.*.source` | `calibrate` for each camera you are solving; in mono mode, `file` plus an `intrinsics:` block for the other one. Both mode refuses a `file` camera. |
+| `solve.pose_source` / `external` | `image` (default) estimates a board pose per frame; `external` fits it to the per-camera PoseArrays and requires `point_pose_topic` on every `calibrate` camera. The `external` group sets sync tolerance, the rigidity gate, matching margins and the EM limit. A goal's `pose_source` overrides the config for that goal. |
+| `cameras.*.point_pose_topic` / `point_pose_frame_id` | External mode only. The PoseArray topic, and the optical frame its header must carry (`point_pose_frame_id` falls back to `external.expected_frame_id`; empty disables the check). |
 | `extrinsic` | `parent`/`child` and the rotation vector / translation from your rig. Direction matters; see `docs/DESIGN.md` section 6. |
 | `check.max_rms_px` | **Must be measured, not guessed.** Run the check once, read the RMS, and set the limit above your rig's floor. `docs/DESIGN.md` section 5 has the method and the numbers for this dataset. |
 | `frames.budget` / `frames.max_duration_s` | Both are ceilings: collection ends at the frame count or the time window, whichever comes first, and the solve runs on what was accepted. Fewer frames give a smaller, weaker calibration, not a failed goal -- only a count below the solver's floor (6 for `n_d=2`) is refused. In both mode the budget is **per camera**. |
@@ -300,20 +429,34 @@ thorough than 1 Hz for this dataset (see Known limits).
 catkin_make run_tests_discocal_ros
 ```
 
-35 tests over the ROS-free core: config parsing and validation for both examples,
-the board lattice ordering (which the cross-camera check depends on), the
-diversity gate, the shared holdout, timestamped directory uniqueness, the
-camera_info layout and atomic writes, joint refine (fixed extrinsic bit-identical,
-fallback, joint-off equals mono), the `.dwecal` generator (size/header/skew/
-refusals/golden land input), the extrinsic direction and baseline, and the
-cross-camera check itself against synthetic frames built from a known-good model
--- including that a wrong extrinsic *direction* is caught -- and the collection
-policy: a short feed above the solver's floor still calibrates, one below it
-fails with the count and the floor in the message. No camera, dataset or
-ROS graph needed. GTest has to be findable; on 18.04 `libgtest-dev` ships
-headers without an archive, so `FindGTest` succeeds only after building
-`/usr/src/googletest` and copying `libgtest*.a` into
-`/usr/lib/x86_64-linux-gnu`.
+56 tests over the ROS-free core, in two suites. `discocal_core_tests` (35
+tests) covers config parsing and validation for both examples, the board
+lattice ordering (which the cross-camera check depends on), the diversity gate,
+the shared holdout, timestamped directory uniqueness, the camera_info layout
+and atomic writes, joint refine (fixed extrinsic bit-identical, fallback,
+joint-off equals mono), the `.dwecal` generator (size/header/skew/refusals/
+golden land input), the extrinsic direction and baseline, and the cross-camera
+check itself against synthetic frames built from a known-good model -- including
+that a wrong extrinsic *direction* is caught -- and the collection policy: a
+short feed above the solver's floor still calibrates, one below it fails with
+the count and the floor in the message. `discocal_external_tests` (21 tests)
+covers the external path: the lattice symmetries (4 for a rectangle, 8 for a
+square), the Kabsch fit and its count mismatch, matching a flipped rectangular
+and a rotated square board, rejection of a non-rigid point cloud, the
+fronto-parallel square resolved by its labels, a 2x2 board matched by label, the
+pose buffer (exact, interpolated, nearest on a gap, tolerance, replacement),
+external config parsing including the shipped example, the mode-dependent grid
+floor (2 per side accepted for external, 1 per side and the image path's 3
+enforced), and the known-pose solve recovering synthetic `K`/`D` from measured
+point positions. No camera, dataset or ROS graph needed.
+
+GTest is resolved by `catkin_add_gtest`: it uses an installed copy, or builds
+the sources `libgtest-dev` ships under `/usr/src/googletest` when there is no
+archive (the stock 18.04 case), and only warns if neither exists. Each suite
+supplies its own `main()` because catkin links gtest but not `gtest_main`.
+(On Melodic, `catkin_test_results` reports twice the real count for gtest XML:
+it adds the root `<testsuites tests=...>` total to the per-suite totals. The
+gtest output above the summary is the authoritative count.)
 
 ## Known limits
 
@@ -330,6 +473,21 @@ headers without an archive, so `FindGTest` succeeds only after building
   improves (0.51/0.54 px, against 2.60/2.35 with joint off) and the result moves
   closer to the offline reference. That is the intended trade, not a regression;
   inspect `rig_calibration.yaml` if your own rig moves further.
+- **External mode inherits its accuracy from the measured positions.** The
+  solver treats every dot position as exact. Arm forward-kinematics error, a
+  static-TF error or a target-mounting offset is *rigid*, so it leaves no
+  residual signature of its own and is absorbed by `K`/`D` instead. The
+  rigidity gate catches a non-rigid or mislabeled cloud, not a rigidly wrong
+  one. Time-sync error under motion is the other first-order bias; see the
+  external section above.
+- **Joint refinement does not run in external mode.** With the board poses
+  measured there are no shared free pose parameters, so the node skips the
+  stage, reports `joint_refined: false` and logs a warning. The two mono
+  results are the answer.
+- **External mode has not been run against a live arm publisher.** It is
+  covered by synthetic unit tests (matching, flips, pose buffer, known-pose
+  solve, config) and shares the cross-camera check with the image path, but the
+  real publisher's latency, jitter and label convention are unverified.
 - **No visualization.** Nothing here needs a display or OpenCV's highgui.
 - **Detector throughput, not feed rate, sets collection time.** One worker thread
   sustains roughly 1.4-1.9 frames/s on this dataset, so a 50-accepted-frame mono

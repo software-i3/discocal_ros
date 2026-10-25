@@ -1,0 +1,222 @@
+# discocal_ros rig configuration -- EXTERNAL BOARD-POSE EXAMPLE.
+#
+# Same rig as config/rig_example_both.yaml, but the board pose is not estimated
+# from the image. For every detected frame, a second node publishes the target
+# dots' positions in that camera's optical frame; this node fits the board pose
+# to them rigidly and solves only the intrinsics and distortion.
+#
+#   rosrun discocal_ros discocal_ros_node _rig_config:=<this file>
+#   rosrun discocal_ros calibrate_client.py --camera both --pose-source external
+#
+# Or leave `pose_source` at the goal's default by setting solve.pose_source:
+# external below. Replace every number and topic with your own rig's.
+#
+# ---------------------------------------------------------------------------
+# THE POINT-POSE CONTRACT
+# ---------------------------------------------------------------------------
+#
+# One geometry_msgs/PoseArray per camera on cameras.<name>.point_pose_topic:
+#
+#   header.stamp     The time the positions are valid for. The node looks this
+#                    up against the image's header.stamp (see `external` below);
+#                    it is not the publication time of the array.
+#   header.frame_id  The camera's OPTICAL frame (z forward, x right, y down --
+#                    the frame the intrinsics project into). Not the ROS body
+#                    frame, which is x forward. `external.expected_frame_id`
+#                    checks this when non-empty.
+#   poses[i]         Position of the dot whose ORIGINAL label is i, in that
+#                    optical frame, in metres. Orientation is ignored.
+#
+# The publisher does not need to know how the board is mounted. It must keep
+# the original pre-assembly label of each dot: a flipped or rotated board
+# permutes labels relative to the detector's own lattice walk, and this node
+# resolves that with the lattice's dihedral symmetry group per frame.
+#
+# The array must carry exactly n_x*n_y poses. The publisher is expected to know
+# the arm state at every stamp it emits, so consecutive arrays may be treated as
+# samples of a moving board.
+#
+# Because the board pose is measured rather than inferred from the image, this
+# mode accepts 2 dots per side (the image path needs 3). A single row or column
+# is still refused: the detector cannot order a line, and Kabsch needs three
+# non-collinear points. A smaller board carries fewer distortion constraints per
+# frame, so cover the image over the run rather than in one view.
+
+board:
+  type: circle
+  n_x: 7
+  n_y: 5
+  radius: 0.0145        # metres; dot RADIUS, not diameter
+  distance: 0.039       # metres; centre-to-centre pitch
+  asymmetric: false
+  detection_mode: ""
+  edge_check: true
+  n_d: 2
+
+detector:
+  size_threshold_px2: 0
+  dist_threshold_px: 0
+  max_candidates: 0
+  edge_contrast: 0
+  edge_inner_uniformity: 0
+  edge_outer_uniformity: 0
+  probe: false
+  edge_stats: false
+
+performance:
+  sparse_info: true
+  block_cov: false
+  sparse_schur: true
+  unc_dump: false
+  time: false
+  detector_threads: 1
+  ceres_threads: 1
+  opencv_threads: 1
+  nice: 0
+  async_spinner_threads: 1
+  collect_during_solve: false
+
+solve:
+  # The default source for every goal. Either goal type may override it with
+  # the action's `pose_source` field (the client exposes --pose-source); a
+  # both-camera goal applies one source to both cameras.
+  pose_source: external
+
+  # Joint refinement does not apply here: the board poses are measured, not
+  # free parameters shared by the two mono problems, so there is nothing for a
+  # joint stage to refine except K/d, which the two cameras do not share. The
+  # node skips it with a warning and reports joint_refined: false. Both cameras
+  # are still solved in one goal, each from its own point-pose feed.
+  joint_refine: false
+  joint_refine_fallback: true
+
+external:
+  # --- time synchronization -----------------------------------------------
+  #
+  # The arm moves continuously, so an image at stamp t must be paired with the
+  # point positions at t, not with the most recently received array. The array
+  # is looked up by header.stamp:
+  #
+  #   - a sample within sync_tolerance_s is used as-is;
+  #   - with interpolate: true and two samples bracketing t no more than
+  #     max_gap_s apart, the positions are linearly interpolated per label;
+  #   - otherwise the nearest sample inside sync_tolerance_s is used.
+  #
+  # Tune sync_tolerance_s to the image latency plus the arm publisher's jitter.
+  # A tolerance much larger than the arm's motion period lets a moving board
+  # be paired with the wrong pose, which biases K and D.
+  sync_tolerance_s: 0.02
+  max_gap_s: 0.1
+  interpolate: true
+
+  # --- matching ------------------------------------------------------------
+  #
+  # How far the measured dot cloud may sit from a rigid copy of the nominal
+  # lattice. The residual is invariant under the board's symmetry relabelings,
+  # so this validates the measurement before any intrinsics are involved.
+  # Metres; 3 mm is generous for a 39 mm pitch and filters label/ordering bugs.
+  max_rigidity_rms_m: 0.003
+
+  # The chosen symmetry's conic reprojection RMS must be below this. This is
+  # scored with the CURRENT K/d, so it tightens as the EM loop progresses.
+  max_match_rms_px: 3.0
+
+  # If the best and second-best symmetries are closer than this, the frame is
+  # ambiguous. Labels normally disambiguate even a face-on symmetric board,
+  # because a wrong pairing puts a dot's measured position on another dot's
+  # pixel. This fires when the pixel geometry cannot separate the candidates --
+  # a small, distant, or edge-on board -- or when detector noise is that large.
+  min_match_margin_px: 0.25
+
+  # Keep the previous frame's symmetry when it scores within this of the best.
+  # Continuity is only a tie-breaker: the chosen candidate must still pass
+  # max_match_rms_px. 0 disables the preference.
+  temporal_margin_px: 0.5
+
+  # "skip" rejects ambiguous frames; "use_best" keeps the best-scoring one and
+  # reports it as ambiguous. "skip" is safer for a rigid arm that can simply
+  # move through more orientations.
+  ambiguous_policy: skip
+
+  # EM passes: match with the current K/d, solve K/d with the matched poses
+  # fixed, rematch, repeat until the permutations stop changing.
+  max_em_iterations: 4
+
+  # Linear initialization of (fx, skew, cx, fy, cy) from the measured 3D points
+  # and their detected pixels. Falls back to config intrinsics and a focal grid
+  # when the linear system is degenerate.
+  use_dlt_initialization: true
+
+  # Whiten each residual by the detector's per-dot covariance, exactly as the
+  # image-only path does. Note that this weights image noise only; error in the
+  # measured point positions is not modelled.
+  use_covariance_weights: true
+
+  # Fallback for cameras that do not set cameras.<name>.point_pose_frame_id.
+  # The comparison is exact and empty disables it. On a stereo rig use the
+  # per-camera field instead: two optical frames never share a name.
+  expected_frame_id: ""
+
+frames:
+  budget: 300
+  max_duration_s: 150.0
+  diversity_gate: true
+  # The diversity signature is computed from the IMAGE, not from the measured
+  # pose. That is intentional: images are what the K/d fit must explain.
+  diversity_threshold: 0.035
+  holdout_fraction: 0.15
+
+check:
+  enabled: true
+  # Held-out cross-camera RMS. In external mode each held-out frame is matched
+  # in BOTH cameras; the check then projects through the own camera's fitted
+  # board pose and the fixed extrinsic, so it measures agreement between the two
+  # measured board poses as well as agreement with the pixels.
+  max_rms_px: 4.0
+  retries: 1
+
+cameras:
+  left:
+    topic: /ikan/explore3d/left/compressed
+    transport: compressed
+    frame_id: explore3d
+    source: calibrate
+    # PoseArray of this camera's dot positions in its OPTICAL frame.
+    point_pose_topic: /arm/calibration_target/left_points
+    # Replace with this rig's real optical frame; the PoseArray's header must
+    # name it. Note this is NOT `frame_id` above, which is the body frame used
+    # in camera_info.
+    point_pose_frame_id: left_optical
+
+  right:
+    topic: /ikan/explore3d/right/compressed
+    transport: compressed
+    frame_id: explore3d
+    source: calibrate
+    point_pose_topic: /arm/calibration_target/right_points
+    point_pose_frame_id: right_optical
+
+# Fixed extrinsic, same direction and semantics as the other examples:
+#     p_parent = R * p_child + t
+# Never estimated, and used unchanged in external mode.
+extrinsic:
+  parent: left
+  child: right
+  rotation:
+    rx: 0.005870
+    ry: 0.013980
+    rz: -0.013437
+  translation:
+    x: 0.099966
+    y: -0.001510
+    z: 0.006461
+
+output:
+  directory: /output
+
+dwecal:
+  enabled: true
+  output_width: 1600
+  output_height: 1200
+  basename: calibration.dwecal
+  require_camera1_right: true

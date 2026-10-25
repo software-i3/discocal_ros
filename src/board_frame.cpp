@@ -56,6 +56,17 @@ Eigen::Vector2d BoardProjector::project(double wx, double wy, double radius,
     return Eigen::Vector2d(p.x, p.y);
 }
 
+std::vector<Eigen::Vector2d> BoardProjector::project_all(
+    const std::vector<Eigen::Vector3d>& lattice, double radius, const Eigen::Matrix4d& T,
+    const ::Params& params, int mode) const {
+    std::vector<Eigen::Vector2d> out;
+    out.reserve(lattice.size());
+    for (std::size_t i = 0; i < lattice.size(); ++i) {
+        out.push_back(project(lattice[i].x(), lattice[i].y(), radius, T, params, mode));
+    }
+    return out;
+}
+
 double BoardProjector::reprojection_error(const std::vector<Eigen::Matrix4d>& T_board_to_camera,
                                           const std::vector<std::vector<::Shape>>& detections,
                                           const std::vector<Eigen::Vector3d>& lattice,

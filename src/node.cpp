@@ -53,6 +53,8 @@
 #include "discocal_ros/calibrate_session.h"
 #include "discocal_ros/image_source.h"
 #include "discocal_ros/performance_report.h"
+#include "discocal_ros/pose_buffer.h"
+#include "discocal_ros/pose_source.h"
 #include "discocal_ros/rig_config.h"
 #include "discocal_ros/rig_session.h"
 
@@ -213,6 +215,18 @@ private:
     // The frame is already BGR. True when the board was found in it.
     bool processFrame(const PendingFrame& frame);
     bool processRigFrame(const PendingFrame& frame);
+    // Fills frame->external from the camera's PoseBuffer. Always attempts the
+    // lookup when the camera has a pose topic, whatever the configured
+    // pose_source: a goal can override the source, and the other camera's
+    // external points are needed by the cross-camera check. Leaves
+    // external.present false with an `error` when nothing close enough exists.
+    void attachExternal(const std::string& camera, std::int64_t stamp_ns,
+                        BoardFrame* frame) const;
+    // Validates a goal's pose_source ("" = the config default) against the
+    // cameras the goal will solve and their pose topics.
+    bool resolvePoseSource(const std::string& requested,
+                           const std::vector<std::string>& cameras,
+                           std::string* pose_source, std::string* error) const;
     // Discards everything already queued, so a collection starts on live frames
     // rather than on a backlog from before the last solve.
     void drainQueue();
@@ -263,6 +277,19 @@ private:
     std::unique_ptr<ros::AsyncSpinner> image_spinner_;
     std::map<std::string, std::unique_ptr<TargetDetector> > detectors_;
 
+    // External pose feeds. One buffer per camera that has a point_pose_topic;
+    // the sources subscribe on the default callback queue (served by the main
+    // ros::spin), not the image queue, so a decode backlog cannot delay them.
+    // Both are built in the constructor and live for the process, so the worker
+    // may read the map without a lock.
+    std::map<std::string, std::unique_ptr<PoseBuffer> > pose_buffers_;
+    std::vector<std::unique_ptr<PoseSource> > pose_sources_;
+
+    // RigConfig::SolveConfig::pose_source as loaded from the file. Each goal may
+    // override it; rig_.solve.pose_source is set from this before every goal so
+    // one goal's override can never leak into the next.
+    std::string configured_pose_source_;
+
     // Written by the callbacks, read by the worker.
     std::mutex mu_;
     std::condition_variable cv_;
@@ -312,6 +339,7 @@ DiscocalNode::DiscocalNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
             "(see config/rig_example.yaml)");
     }
     rig_ = RigConfig::load(rig_path);
+    configured_pose_source_ = rig_.solve.pose_source;
 
     // Before anything can read them: the vendored detector's tuning knobs and
     // the calibrator's performance switches are environment variables, and some
@@ -370,6 +398,21 @@ DiscocalNode::DiscocalNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
             new TargetDetector(rig_.board.n_x, rig_.board.n_y, rig_.board.asymmetric, false));
         sources_.push_back(std::unique_ptr<ImageSource>(
             new ImageSource(image_nh, it->second, &DiscocalNode::onFrame, this, &collecting_)));
+
+        if (!it->second.point_pose_topic.empty()) {
+            pose_buffers_[it->first].reset(new PoseBuffer());
+            // The buffer outlives the subscription (both are members destroyed
+            // with the node), and capturing it directly keeps the pose
+            // callback off the node's bookkeeping.
+            PoseBuffer* buffer = pose_buffers_[it->first].get();
+            pose_sources_.push_back(std::unique_ptr<PoseSource>(new PoseSource(
+                nh_, it->first, it->second.point_pose_topic,
+                [buffer](const PoseSample& sample) { buffer->add(sample); })));
+        }
+    }
+    if (configured_pose_source_ == "external") {
+        ROS_INFO("discocal_ros: board poses come from point_pose_topic by default; a goal may "
+                 "override this with pose_source");
     }
     image_spinner_.reset(new ros::AsyncSpinner(
         static_cast<std::uint32_t>(std::max(1, rig_.performance.async_spinner_threads)),
@@ -561,6 +604,8 @@ void DiscocalNode::publishFeedback(const std::string& state, const CalibrateSess
         feedback.frames_accepted = static_cast<uint32_t>(std::max(0, stats.accepted));
         feedback.frames_duplicate = static_cast<uint32_t>(std::max(0, stats.duplicate));
         feedback.frames_unpaired = static_cast<uint32_t>(std::max(0, stats.unpaired));
+        feedback.frames_pose_missing = static_cast<uint32_t>(std::max(0, stats.pose_missing));
+        feedback.frames_pose_invalid = static_cast<uint32_t>(std::max(0, stats.pose_invalid));
     }
     feedback.progress =
         budget > 0 ? static_cast<float>(feedback.frames_accepted) / static_cast<float>(budget)
@@ -582,6 +627,8 @@ void DiscocalNode::publishFeedback(const std::string& state, const CalibrateSess
         progress_entry.frames_unpaired = feedback.frames_unpaired;
         progress_entry.budget = feedback.budget;
         progress_entry.progress = feedback.progress;
+        progress_entry.frames_pose_missing = feedback.frames_pose_missing;
+        progress_entry.frames_pose_invalid = feedback.frames_pose_invalid;
         feedback.cameras.push_back(progress_entry);
     }
 
@@ -602,9 +649,11 @@ void DiscocalNode::publishFeedback(const std::string& state, const CalibrateSess
     const int accepted = static_cast<int>(feedback.frames_accepted);
     if (force_log || last_logged_accepted_[camera] != accepted) {
         last_logged_accepted_[camera] = accepted;
-        ROS_INFO("discocal_ros: %s: %s: %u/%u accepted (%u detected, %u duplicate, %u unpaired)",
+        ROS_INFO("discocal_ros: %s: %s: %u/%u accepted (%u detected, %u duplicate, %u unpaired, "
+                 "%u pose missing, %u pose invalid)",
                  state.c_str(), camera.c_str(), feedback.frames_accepted, feedback.budget,
-                 feedback.frames_detected, feedback.frames_duplicate, feedback.frames_unpaired);
+                 feedback.frames_detected, feedback.frames_duplicate, feedback.frames_unpaired,
+                 feedback.frames_pose_missing, feedback.frames_pose_invalid);
     }
 }
 
@@ -639,6 +688,10 @@ void DiscocalNode::publishRigFeedback(const std::string& state, int budget, bool
                                      static_cast<float>(budget)
                                : 0.0f;
                 if (entry.progress > 1.0f) entry.progress = 1.0f;
+                entry.frames_pose_missing =
+                    static_cast<std::uint32_t>(std::max(0, stats.pose_missing));
+                entry.frames_pose_invalid =
+                    static_cast<std::uint32_t>(std::max(0, stats.pose_invalid));
                 return entry;
             }();
             feedback.cameras.push_back(progress);
@@ -654,6 +707,8 @@ void DiscocalNode::publishRigFeedback(const std::string& state, int budget, bool
             feedback.frames_unpaired = first.frames_unpaired;
             feedback.budget = first.budget;
             feedback.progress = first.progress;
+            feedback.frames_pose_missing = first.frames_pose_missing;
+            feedback.frames_pose_invalid = first.frames_pose_invalid;
         }
     }
 
@@ -679,9 +734,11 @@ void DiscocalNode::publishRigFeedback(const std::string& state, int budget, bool
     for (std::size_t i = 0; i < feedback.cameras.size(); ++i) {
         const CameraProgress& entry = feedback.cameras[i];
         last_logged_accepted_[entry.camera] = static_cast<int>(entry.frames_accepted);
-        ROS_INFO("discocal_ros: %s: %s: %u/%u accepted (%u detected, %u duplicate, %u unpaired)",
+        ROS_INFO("discocal_ros: %s: %s: %u/%u accepted (%u detected, %u duplicate, %u unpaired, "
+                 "%u pose missing, %u pose invalid)",
                  state.c_str(), entry.camera.c_str(), entry.frames_accepted, entry.budget,
-                 entry.frames_detected, entry.frames_duplicate, entry.frames_unpaired);
+                 entry.frames_detected, entry.frames_duplicate, entry.frames_unpaired,
+                 entry.frames_pose_missing, entry.frames_pose_invalid);
     }
 }
 
@@ -707,6 +764,12 @@ void DiscocalNode::fillCameraCalibration(const std::string& camera,
     out->camera_info_path = result.camera_info_path;
     out->fit_seconds = result.fit_seconds;
     out->uncertainties_from_mono_stage = uncertainties_from_mono_stage;
+    out->pose_source = result.pose_source;
+    out->frames_matched = static_cast<uint32_t>(std::max(0, result.frames_matched));
+    out->frames_ambiguous = static_cast<uint32_t>(std::max(0, result.frames_ambiguous));
+    out->frames_rejected_external =
+        static_cast<uint32_t>(std::max(0, result.frames_rejected_external));
+    out->mean_rigidity_rms_m = result.mean_rigidity_rms_m;
 
     out->check_ran = result.check.ran;
     out->check_passed = result.check.passed;
@@ -757,6 +820,12 @@ void DiscocalNode::fillResult(const std::string& camera, const SessionResult& re
     out->n_frames_heldout = static_cast<uint32_t>(std::max(0, result.n_frames_heldout));
     out->camera_info_path = result.camera_info_path;
     out->attempts = static_cast<uint32_t>(std::max(0, result.attempts));
+    out->pose_source = result.pose_source;
+    out->frames_matched = static_cast<uint32_t>(std::max(0, result.frames_matched));
+    out->frames_ambiguous = static_cast<uint32_t>(std::max(0, result.frames_ambiguous));
+    out->frames_rejected_external =
+        static_cast<uint32_t>(std::max(0, result.frames_rejected_external));
+    out->mean_rigidity_rms_m = result.mean_rigidity_rms_m;
 
     out->check_ran = result.check.ran;
     out->check_passed = result.check.passed;
@@ -814,6 +883,7 @@ void DiscocalNode::fillRigResult(const RigSessionResult& result,
     out->success = result.success;
     out->message = result.message;
     out->attempts = static_cast<std::uint32_t>(std::max(0, result.attempts));
+    out->pose_source = result.pose_source;
 
     out->joint_refined = result.joint_refined;
     out->joint_fit_seconds = result.joint_fit_seconds;
@@ -834,6 +904,10 @@ void DiscocalNode::fillRigResult(const RigSessionResult& result,
     int total_frames = 0;
     int total_heldout = 0;
     double worst_reprojection = 0.0;
+    int total_matched = 0;
+    int total_ambiguous = 0;
+    int total_rejected_external = 0;
+    double worst_rigidity = 0.0;
     bool any_check_ran = false;
     bool all_checks_ran = !result.cameras.empty();
     bool all_checks_passed = true;
@@ -848,6 +922,10 @@ void DiscocalNode::fillRigResult(const RigSessionResult& result,
         total_frames += camera.result.n_frames;
         total_heldout += camera.result.n_frames_heldout;
         worst_reprojection = std::max(worst_reprojection, camera.result.reprojection_error);
+        total_matched += camera.result.frames_matched;
+        total_ambiguous += camera.result.frames_ambiguous;
+        total_rejected_external += camera.result.frames_rejected_external;
+        worst_rigidity = std::max(worst_rigidity, camera.result.mean_rigidity_rms_m);
 
         if (!camera.result.check.ran) {
             all_checks_ran = false;
@@ -864,6 +942,11 @@ void DiscocalNode::fillRigResult(const RigSessionResult& result,
     out->n_frames = static_cast<std::uint32_t>(std::max(0, total_frames));
     out->n_frames_heldout = static_cast<std::uint32_t>(std::max(0, total_heldout));
     out->reprojection_error = worst_reprojection;
+    out->frames_matched = static_cast<std::uint32_t>(std::max(0, total_matched));
+    out->frames_ambiguous = static_cast<std::uint32_t>(std::max(0, total_ambiguous));
+    out->frames_rejected_external =
+        static_cast<std::uint32_t>(std::max(0, total_rejected_external));
+    out->mean_rigidity_rms_m = worst_rigidity;
 
     // The check scalars describe the worst camera, as documented in the action.
     out->check_ran = all_checks_ran;
@@ -883,6 +966,80 @@ void DiscocalNode::fillRigResult(const RigSessionResult& result,
 bool DiscocalNode::stopRequested() {
     std::lock_guard<std::mutex> lock(mu_);
     return stop_ || pending_goal_ || preempt_requested_;
+}
+
+void DiscocalNode::attachExternal(const std::string& camera, std::int64_t stamp_ns,
+                                  BoardFrame* frame) const {
+    frame->external = ExternalPoints();
+
+    const std::map<std::string, std::unique_ptr<PoseBuffer> >::const_iterator buffer =
+        pose_buffers_.find(camera);
+    if (buffer == pose_buffers_.end() || !buffer->second) return;
+
+    PoseSample sample;
+    double dt_s = 0.0;
+    std::int64_t source_stamp_ns = 0;
+    if (!buffer->second->lookup(stamp_ns, rig_.external.sync_tolerance_s,
+                                rig_.external.max_gap_s, rig_.external.interpolate, &sample,
+                                &dt_s, &source_stamp_ns)) {
+        std::ostringstream oss;
+        oss << "no pose sample within " << rig_.external.sync_tolerance_s
+            << " s of the frame stamp";
+        frame->external.error = oss.str();
+        return;
+    }
+
+    frame->external.present = true;
+    // lookup() returns a sample whose stamp equals the requested one only for
+    // an exact hit or a blended result; a nearest-neighbour result keeps the
+    // message's stamp. Combined with source_stamp_ns that distinguishes the two.
+    frame->external.interpolated =
+        dt_s > 0.0 && source_stamp_ns != stamp_ns && sample.stamp_ns == stamp_ns;
+    frame->external.source_stamp_ns = source_stamp_ns;
+    frame->external.dt_s = dt_s;
+    frame->external.frame_id = sample.frame_id;
+    frame->external.points = sample.points;
+}
+
+bool DiscocalNode::resolvePoseSource(const std::string& requested,
+                                     const std::vector<std::string>& cameras,
+                                     std::string* pose_source, std::string* error) const {
+    *pose_source = requested.empty() ? configured_pose_source_ : requested;
+    if (*pose_source != "image" && *pose_source != "external") {
+        *error = "pose_source must be \"image\", \"external\" or empty (use the config), not \"" +
+                 *pose_source + "\"";
+        return false;
+    }
+    // The config's own mode sets the board-size floor at load time, but a goal
+    // can override the mode. Keep the image path's stricter floor enforced here
+    // so a 2xN board configured for external mode cannot be run with image
+    // poses, where its rotation about the long axis is poorly constrained.
+    if (*pose_source == "image" && (rig_.board.n_x < 3 || rig_.board.n_y < 3)) {
+        *error = "pose_source is \"image\" but board.n_x and board.n_y are below the image "
+                 "path's minimum of 3 per side; this board needs pose_source \"external\"";
+        return false;
+    }
+    if (*pose_source != "external") return true;
+
+    for (std::size_t i = 0; i < cameras.size(); ++i) {
+        const CameraConfig* config = rig_.camera(cameras[i]);
+        if (config == NULL) {
+            *error = "pose_source is \"external\" but camera \"" + cameras[i] +
+                     "\" is not in the rig config";
+            return false;
+        }
+        if (config->point_pose_topic.empty()) {
+            *error = "pose_source is \"external\" but camera \"" + cameras[i] +
+                     "\" has no point_pose_topic in the rig config";
+            return false;
+        }
+        if (pose_buffers_.find(cameras[i]) == pose_buffers_.end()) {
+            *error = "pose_source is \"external\" but this node has no pose subscriber for \"" +
+                     cameras[i] + "\"";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool DiscocalNode::processFrame(const PendingFrame& frame) {
@@ -912,6 +1069,7 @@ bool DiscocalNode::processFrame(const PendingFrame& frame) {
         // The first decoded frame of the goal camera is what tells the session
         // the image size the gate normalises by.
         if (!session_->has_image_size()) session_->set_image_size(gray.cols, gray.rows);
+        attachExternal(frame.camera, frame.stamp_ns, &board_frame);
         session_->on_detection(board_frame);
         return true;
     }
@@ -921,6 +1079,10 @@ bool DiscocalNode::processFrame(const PendingFrame& frame) {
     ++other_seen_;
     if (!target.first) return false;
     ++other_detected_;
+    // External mode's held-out check matches the other camera's detections too,
+    // so it needs that camera's measured dot positions even when this goal is
+    // only calibrating one camera.
+    attachExternal(frame.camera, frame.stamp_ns, &board_frame);
     session_->on_other_detection(board_frame);
     return true;
 }
@@ -945,6 +1107,7 @@ bool DiscocalNode::processRigFrame(const PendingFrame& frame) {
     board_frame.camera = frame.camera;
     board_frame.stamp_ns = frame.stamp_ns;
     board_frame.shapes = target.second;
+    attachExternal(frame.camera, frame.stamp_ns, &board_frame);
 
     // The first decoded frame of each camera tells its session the image size
     // the diversity gate normalises by and the calibrator scales matrices with.
@@ -960,6 +1123,11 @@ bool DiscocalNode::processRigFrame(const PendingFrame& frame) {
 void DiscocalNode::runGoal(const boost::shared_ptr<const ActionServer::Goal>& goal) {
     const std::string camera = goal->camera;
     const bool allow_unchecked = goal->allow_unchecked;
+
+    // Every goal starts from the config's pose source. A goal may override it
+    // below; resetting here means an override can never leak into the next goal
+    // even when this one is preempted or fails before the solve.
+    rig_.solve.pose_source = configured_pose_source_;
 
     ActionServer::Result result;
 
@@ -1012,6 +1180,25 @@ void DiscocalNode::runGoal(const boost::shared_ptr<const ActionServer::Goal>& go
         return;
     }
 
+    // The goal's pose source (or the config's when it is empty) decides how
+    // this camera's board poses are obtained. Resolve before the session is
+    // constructed: CalibrateSession copies the rig, so the mode is fixed for the
+    // whole goal.
+    std::string pose_source;
+    std::string pose_error;
+    if (!resolvePoseSource(goal->pose_source, std::vector<std::string>(1, camera),
+                           &pose_source, &pose_error)) {
+        result.message = pose_error;
+        ROS_ERROR("discocal_ros: %s", result.message.c_str());
+        abortGoal(result, "");
+        return;
+    }
+    rig_.solve.pose_source = pose_source;
+    if (pose_source == "external") {
+        ROS_INFO("discocal_ros: %s: board poses come from externally measured point poses",
+                 camera.c_str());
+    }
+
     const int effective_budget = goal->budget > 0 ? static_cast<int>(goal->budget)
                                                   : rig_.frames.budget;
     const int max_attempts = 1 + std::max(0, rig_.check.retries);
@@ -1023,6 +1210,15 @@ void DiscocalNode::runGoal(const boost::shared_ptr<const ActionServer::Goal>& go
     if (!session_->check_configured()) {
         ROS_WARN("discocal_ros: the cross-camera check cannot run for %s: %s", camera.c_str(),
                  session_->check_unavailable_reason().c_str());
+    }
+    if (pose_source == "external" && session_->check_configured()) {
+        const CameraConfig* other_config = rig_.camera(session_->other_camera());
+        if (other_config == NULL || other_config->point_pose_topic.empty()) {
+            ROS_WARN("discocal_ros: %s: external mode needs this camera's measured poses to run "
+                     "the check, but %s has no point_pose_topic; held-out frames cannot be "
+                     "scored",
+                     camera.c_str(), session_->other_camera().c_str());
+        }
     }
 
     SessionResult session_result;
@@ -1121,6 +1317,15 @@ void DiscocalNode::runGoal(const boost::shared_ptr<const ActionServer::Goal>& go
                  session_->stats().accepted - session_->stats().unpaired,
                  session_->stats().accepted);
 
+        if (session_result.pose_source == "external") {
+            ROS_INFO("discocal_ros: %s: external poses: %d matched, %d ambiguous, %d rejected; "
+                     "mean rigidity RMS %.3f mm",
+                     camera.c_str(), session_result.frames_matched,
+                     session_result.frames_ambiguous,
+                     session_result.frames_rejected_external,
+                     session_result.mean_rigidity_rms_m * 1000.0);
+        }
+
         if (session_result.success) break;
 
         ROS_WARN("discocal_ros: %s: attempt %d failed: %s", camera.c_str(), attempt,
@@ -1184,6 +1389,23 @@ void DiscocalNode::runRigGoal(const boost::shared_ptr<const ActionServer::Goal>&
 
     ActionServer::Result result;
     performance_.begin(goal->camera, effective_budget);
+
+    // As in the mono path, resolve the source before the session copies the
+    // rig; RigSession takes RigConfig by value.
+    rig_.solve.pose_source = configured_pose_source_;
+    std::string pose_source;
+    std::string pose_error;
+    if (!resolvePoseSource(goal->pose_source, cameras, &pose_source, &pose_error)) {
+        result.message = pose_error;
+        ROS_ERROR("discocal_ros: %s", result.message.c_str());
+        abortGoal(result, "");
+        return;
+    }
+    rig_.solve.pose_source = pose_source;
+    if (pose_source == "external") {
+        ROS_INFO("discocal_ros: both-camera goal: board poses come from externally measured "
+                 "point poses");
+    }
 
     // Neither camera's result exists at the start, so the known-intrinsics map
     // is deliberately empty: RigSession supplies each partner's final params

@@ -50,17 +50,25 @@ def feedback_cb(fb):
     # entry per camera, and the scalars mirror only the first.
     if len(fb.cameras) > 1:
         for cam in fb.cameras:
-            print("%-11s %-8s seen=%-4d detected=%-4d accepted=%-3d dup=%-4d "
-                  "unpaired=%-3d budget=%-3d %3.0f%%"
-                  % (fb.state, cam.camera, cam.frames_seen, cam.frames_detected,
-                     cam.frames_accepted, cam.frames_duplicate,
-                     cam.frames_unpaired, cam.budget, 100.0 * cam.progress))
+            line = ("%-11s %-8s seen=%-4d detected=%-4d accepted=%-3d dup=%-4d "
+                    "unpaired=%-3d budget=%-3d %3.0f%%"
+                    % (fb.state, cam.camera, cam.frames_seen, cam.frames_detected,
+                       cam.frames_accepted, cam.frames_duplicate,
+                       cam.frames_unpaired, cam.budget, 100.0 * cam.progress))
+            if cam.frames_pose_missing or cam.frames_pose_invalid:
+                line += (" pose_missing=%d pose_invalid=%d"
+                         % (cam.frames_pose_missing, cam.frames_pose_invalid))
+            print(line)
         return
-    print("%-11s seen=%-4d detected=%-4d accepted=%-3d dup=%-4d "
-          "unpaired=%-3d budget=%-3d %3.0f%%"
-          % (fb.state, fb.frames_seen, fb.frames_detected, fb.frames_accepted,
-             fb.frames_duplicate, fb.frames_unpaired, fb.budget,
-             100.0 * fb.progress))
+    line = ("%-11s seen=%-4d detected=%-4d accepted=%-3d dup=%-4d "
+            "unpaired=%-3d budget=%-3d %3.0f%%"
+            % (fb.state, fb.frames_seen, fb.frames_detected, fb.frames_accepted,
+               fb.frames_duplicate, fb.frames_unpaired, fb.budget,
+               100.0 * fb.progress))
+    if fb.frames_pose_missing or fb.frames_pose_invalid:
+        line += (" pose_missing=%d pose_invalid=%d"
+                 % (fb.frames_pose_missing, fb.frames_pose_invalid))
+    print(line)
 
 
 def print_camera(c):
@@ -80,6 +88,14 @@ def print_camera(c):
     print("  [%s] reprojection_error %.6f px" % (c.camera, c.reprojection_error))
     print("  [%s] n_frames           %d (%d held out)"
           % (c.camera, c.n_frames, c.n_frames_heldout))
+    print("  [%s] pose_source        %s"
+          % (c.camera, c.pose_source or "image"))
+    if c.pose_source == "external":
+        print("  [%s] external match     matched=%d ambiguous=%d rejected=%d"
+              % (c.camera, c.frames_matched, c.frames_ambiguous,
+                 c.frames_rejected_external))
+        print("  [%s] rigidity_rms_m     %.6f"
+              % (c.camera, c.mean_rigidity_rms_m))
     print("  [%s] fit_seconds        %.3f" % (c.camera, c.fit_seconds))
     print("  [%s] camera_info_path   %s"
           % (c.camera, c.camera_info_path or "(none)"))
@@ -110,6 +126,12 @@ def print_result(r):
     print("  reprojection_error      %.6f px" % r.reprojection_error)
     print("  n_frames                %d" % r.n_frames)
     print("  n_frames_heldout        %d" % r.n_frames_heldout)
+    print("  pose_source             %s" % (r.pose_source or "image"))
+    if r.pose_source == "external":
+        print("  external match          matched=%d ambiguous=%d rejected=%d"
+              % (r.frames_matched, r.frames_ambiguous,
+                 r.frames_rejected_external))
+        print("  mean_rigidity_rms_m     %.6f" % r.mean_rigidity_rms_m)
     print("  camera_info_path        %s" % (r.camera_info_path or "(none)"))
     print("  check_ran               %s" % r.check_ran)
     print("  check_passed            %s" % r.check_passed)
@@ -146,6 +168,13 @@ def main():
                         help="write the result even if the cross-camera check "
                              "could not run. Does NOT overrule a check that ran "
                              "and failed.")
+    parser.add_argument("--pose-source", default="", choices=["", "image", "external"],
+                        help="board-pose source for this goal: image (estimate the "
+                             "pose from the detections) or external (fit it to the "
+                             "per-camera point_pose_topic PoseArray). Empty keeps "
+                             "the rig config's solve.pose_source. A both-camera "
+                             "goal applies the same source to both cameras "
+                             "(default: empty)")
     parser.add_argument("--action", default=DEFAULT_ACTION,
                         help="action server name (default: %s)" % DEFAULT_ACTION)
     parser.add_argument("--timeout", type=float, default=900.0,
@@ -167,8 +196,10 @@ def main():
     goal.camera = args.camera
     goal.budget = args.budget
     goal.allow_unchecked = args.allow_unchecked
-    print("sending goal camera=%s budget=%d allow_unchecked=%s"
-          % (args.camera, args.budget, args.allow_unchecked))
+    goal.pose_source = args.pose_source
+    print("sending goal camera=%s budget=%d allow_unchecked=%s pose_source=%s"
+          % (args.camera, args.budget, args.allow_unchecked,
+             args.pose_source or "(config)"))
     client.send_goal(goal, feedback_cb=None if args.quiet else feedback_cb)
 
     if not client.wait_for_result(rospy.Duration(args.timeout)):

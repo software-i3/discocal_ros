@@ -37,6 +37,13 @@ struct SessionStats {
     // Only meaningful once solve() (or finalize()) has run; until then it counts
     // what was known at the moment each frame was accepted, so it can only fall.
     int unpaired = 0;
+    // External-pose mode: detections that arrived with no usable pose sample
+    // for their stamp (nothing on the topic, or outside sync_tolerance_s), and
+    // detections whose sample existed but could not be used (wrong dot count,
+    // wrong frame_id, a non-finite or non-positive-z position). Both are
+    // counted before the diversity gate, so they never enter `accepted`.
+    int pose_missing = 0;
+    int pose_invalid = 0;
 };
 
 struct SessionResult {
@@ -55,6 +62,14 @@ struct SessionResult {
     std::string camera_info_path;      // "" when nothing was written
     std::string raw_output_directory;  // where the library wrote its own results
     double fit_seconds = 0.0;
+
+    // Which path produced this result, and the external-path diagnostics. In
+    // image mode these stay at their defaults ("image", zeros).
+    std::string pose_source = "image";
+    int frames_matched = 0;       // external mode: frames that entered the fit
+    int frames_ambiguous = 0;     // external mode: symmetry margin below the limit
+    int frames_rejected_external = 0;  // external mode: not matched for any reason
+    double mean_rigidity_rms_m = 0.0;
 };
 
 // The result of the mono solve alone, before any cross-camera verdict. Kept
@@ -83,6 +98,14 @@ struct SolveOutcome {
     std::vector<std::int64_t> fit_stamps;
     std::vector<std::vector<::Shape> > fit_shapes;
     std::vector<Eigen::Matrix4d> fit_poses;
+
+    // External-path diagnostics, mirroring SessionResult.
+    std::string pose_source = "image";
+    int matched_frames = 0;
+    int ambiguous_frames = 0;
+    int rejected_external_frames = 0;
+    double mean_rigidity_rms_m = 0.0;
+    std::string initialization;
 
     // The held-out frames with their detections. `T` is filled by evaluate(),
     // which re-solves the poses against the final intrinsics -- after a joint
@@ -225,12 +248,21 @@ private:
 
     // Accepted frames for the camera being calibrated, in arrival order.
     std::vector<BoardFrame> accepted_;
-    // The other camera's detections, by stamp, pruned to a bounded history: an
+    // The other camera's frames, by stamp, pruned to a bounded history: an
     // accepted frame and the other camera's frame for the same instant arrive
     // within milliseconds of each other, so a few seconds of slack is ample.
-    std::map<std::int64_t, std::vector<::Shape> > other_;
+    // The whole frame, not only the shapes, because external-mode evaluation
+    // also needs that camera's measured dot positions.
+    std::map<std::int64_t, BoardFrame> other_;
     std::deque<std::int64_t> other_order_;
     static const std::size_t kOtherHistory = 600;
+
+    // External-pose path. `fit_positions` and `holdout_positions` index
+    // accepted_ and are selected exactly as in the image path.
+    SolveOutcome solve_external(const std::vector<int>& fit_positions,
+                                const std::vector<int>& holdout_positions, int attempt);
+    CheckResult evaluate_external(const SolveOutcome& outcome,
+                                  const ::Params& final_params) const;
 };
 
 }  // namespace discocal_ros

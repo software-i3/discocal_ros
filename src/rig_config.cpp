@@ -113,9 +113,6 @@ RigConfig RigConfig::load(const std::string& path) {
         throw std::runtime_error("rig config: board.type must be \"circle\" or \"square\", got \"" +
                                  cfg.board.type + "\"");
     }
-    if (cfg.board.n_x < 3 || cfg.board.n_y < 3) {
-        throw std::runtime_error("rig config: board.n_x and board.n_y must both be at least 3");
-    }
     // Calibrator::calibrate walks `ds[0..n_d]` of a 5-element table.
     if (cfg.board.n_d < 1 || cfg.board.n_d > 4) {
         throw std::runtime_error("rig config: board.n_d must be between 1 and 4");
@@ -179,8 +176,85 @@ RigConfig RigConfig::load(const std::string& path) {
 
     // --- solve -------------------------------------------------------------
     if (const YAML::Node solve = root["solve"]) {
+        read_opt<std::string>(solve, "pose_source", &cfg.solve.pose_source);
         read_opt<bool>(solve, "joint_refine", &cfg.solve.joint_refine);
         read_opt<bool>(solve, "joint_refine_fallback", &cfg.solve.joint_refine_fallback);
+    }
+    cfg.solve.pose_source = trim(cfg.solve.pose_source);
+    if (cfg.solve.pose_source != "image" && cfg.solve.pose_source != "external") {
+        throw std::runtime_error("rig config: solve.pose_source must be \"image\" or "
+                                 "\"external\", got \"" +
+                                 cfg.solve.pose_source + "\"");
+    }
+    // The grid-size floor depends on where the board pose comes from. With
+    // pose_source image, the pose is estimated from the dots themselves, and a
+    // 2xN board leaves the rotation about the long axis poorly constrained, so
+    // both sides need at least 3. With pose_source external the pose is fitted
+    // from measured 3D positions, so the image does not have to constrain it
+    // and 2 per side is enough. It is also the floor regardless of source:
+    // CircleGridFinder needs a four-corner convex hull to order the dots
+    // (CCircleGridFinder.cpp:92-100), so a single row or column is a line it
+    // cannot order, and Kabsch needs three non-collinear points. A 2x2 board
+    // is the smallest lattice that satisfies both.
+    if (cfg.solve.pose_source == "external") {
+        if (cfg.board.n_x < 2 || cfg.board.n_y < 2) {
+            throw std::runtime_error(
+                "rig config: with solve.pose_source \"external\", board.n_x and board.n_y "
+                "must both be at least 2 (a single row or column is not a detectable grid)");
+        }
+    } else if (cfg.board.n_x < 3 || cfg.board.n_y < 3) {
+        throw std::runtime_error(
+            "rig config: with solve.pose_source \"image\", board.n_x and board.n_y must "
+            "both be at least 3");
+    }
+
+    // --- external pose source ---------------------------------------------
+    if (const YAML::Node ext = root["external"]) {
+        read_opt<double>(ext, "sync_tolerance_s", &cfg.external.sync_tolerance_s);
+        read_opt<double>(ext, "max_gap_s", &cfg.external.max_gap_s);
+        read_opt<bool>(ext, "interpolate", &cfg.external.interpolate);
+        read_opt<double>(ext, "max_rigidity_rms_m", &cfg.external.max_rigidity_rms_m);
+        read_opt<double>(ext, "max_match_rms_px", &cfg.external.max_match_rms_px);
+        read_opt<double>(ext, "min_match_margin_px", &cfg.external.min_match_margin_px);
+        read_opt<double>(ext, "temporal_margin_px", &cfg.external.temporal_margin_px);
+        read_opt<std::string>(ext, "ambiguous_policy", &cfg.external.ambiguous_policy);
+        read_opt<int>(ext, "max_em_iterations", &cfg.external.max_em_iterations);
+        read_opt<bool>(ext, "use_dlt_initialization",
+                       &cfg.external.use_dlt_initialization);
+        read_opt<bool>(ext, "use_covariance_weights",
+                       &cfg.external.use_covariance_weights);
+        read_opt<std::string>(ext, "expected_frame_id", &cfg.external.expected_frame_id);
+    }
+    cfg.external.ambiguous_policy = trim(cfg.external.ambiguous_policy);
+    cfg.external.expected_frame_id = trim(cfg.external.expected_frame_id);
+    if (cfg.external.ambiguous_policy != "skip" &&
+        cfg.external.ambiguous_policy != "use_best") {
+        throw std::runtime_error("rig config: external.ambiguous_policy must be \"skip\" or "
+                                 "\"use_best\", got \"" +
+                                 cfg.external.ambiguous_policy + "\"");
+    }
+    if (!(cfg.external.sync_tolerance_s > 0.0)) {
+        throw std::runtime_error("rig config: external.sync_tolerance_s must be positive");
+    }
+    if (!(cfg.external.max_gap_s > 0.0)) {
+        throw std::runtime_error("rig config: external.max_gap_s must be positive");
+    }
+    if (!(cfg.external.max_rigidity_rms_m > 0.0)) {
+        throw std::runtime_error("rig config: external.max_rigidity_rms_m must be positive");
+    }
+    if (!(cfg.external.max_match_rms_px > 0.0)) {
+        throw std::runtime_error("rig config: external.max_match_rms_px must be positive");
+    }
+    if (cfg.external.min_match_margin_px < 0.0) {
+        throw std::runtime_error(
+            "rig config: external.min_match_margin_px cannot be negative");
+    }
+    if (cfg.external.temporal_margin_px < 0.0) {
+        throw std::runtime_error(
+            "rig config: external.temporal_margin_px cannot be negative");
+    }
+    if (cfg.external.max_em_iterations < 1) {
+        throw std::runtime_error("rig config: external.max_em_iterations must be at least 1");
     }
 
     // --- frames ------------------------------------------------------------
@@ -229,6 +303,10 @@ RigConfig RigConfig::load(const std::string& path) {
         read_opt<std::string>(node, "transport", &cam.transport);
         read_opt<std::string>(node, "frame_id", &cam.frame_id);
         read_opt<std::string>(node, "source", &cam.source);
+        read_opt<std::string>(node, "point_pose_topic", &cam.point_pose_topic);
+        cam.point_pose_topic = trim(cam.point_pose_topic);
+        read_opt<std::string>(node, "point_pose_frame_id", &cam.point_pose_frame_id);
+        cam.point_pose_frame_id = trim(cam.point_pose_frame_id);
 
         if (cam.transport != "compressed" && cam.transport != "raw") {
             throw std::runtime_error("rig config: " + context +
@@ -253,6 +331,23 @@ RigConfig RigConfig::load(const std::string& path) {
         }
 
         cfg.cameras[cam.name] = cam;
+    }
+
+    // External-pose mode needs a pose feed for every camera this node is asked
+    // to solve. A `file` camera is not solved, but it is the other half of the
+    // cross-camera check; without its pose feed that check can only fall back
+    // to an unchecked goal, so say so at load time rather than after a
+    // collection. (Not fatal: allow_unchecked is a legitimate way to run.)
+    if (cfg.solve.pose_source == "external") {
+        for (std::map<std::string, CameraConfig>::const_iterator it = cfg.cameras.begin();
+             it != cfg.cameras.end(); ++it) {
+            if (it->second.source == "calibrate" && it->second.point_pose_topic.empty()) {
+                throw std::runtime_error(
+                    "rig config: solve.pose_source is \"external\" but cameras." + it->first +
+                    ".point_pose_topic is empty; every calibrated camera needs a PoseArray "
+                    "feed of its dots in its optical frame");
+            }
+        }
     }
 
     // --- extrinsic ---------------------------------------------------------

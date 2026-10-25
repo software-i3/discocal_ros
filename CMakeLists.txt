@@ -31,6 +31,7 @@ find_package(catkin REQUIRED COMPONENTS
     roscpp
     std_msgs
     sensor_msgs
+    geometry_msgs
     cv_bridge
     actionlib
     actionlib_msgs
@@ -167,7 +168,8 @@ set(yaml-cpp_LIBRARIES ${_yaml_cpp_library})
 catkin_package(
     INCLUDE_DIRS include
     LIBRARIES discocal_core
-    CATKIN_DEPENDS roscpp std_msgs sensor_msgs cv_bridge actionlib actionlib_msgs
+    CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs cv_bridge actionlib
+                   actionlib_msgs
     DEPENDS OpenCV Ceres yaml-cpp)
 
 # ---------------------------------------------------------------------------
@@ -242,6 +244,9 @@ add_library(discocal_core STATIC
     src/board_frame.cpp
     src/cross_camera_check.cpp
     src/camera_info_writer.cpp
+    src/pose_buffer.cpp
+    src/external_points.cpp
+    src/known_pose_solver.cpp
     src/calibrate_session.cpp
     src/rig_session.cpp
     src/performance_report.cpp
@@ -260,7 +265,8 @@ target_link_libraries(discocal_core PUBLIC discocal_vendor)
 # ---------------------------------------------------------------------------
 add_executable(discocal_ros_node
     src/node.cpp
-    src/image_source.cpp)
+    src/image_source.cpp
+    src/pose_source.cpp)
 
 # ${catkin_INCLUDE_DIRS} has to be named explicitly. In this catkin version
 # ${catkin_LIBRARIES} is a list of library paths rather than imported targets, so
@@ -285,12 +291,21 @@ target_link_libraries(dwecal_gen_cli discocal_core)
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-find_package(GTest QUIET)
-if(GTest_FOUND OR GTEST_FOUND)
-    catkin_add_gtest(discocal_core_tests test/test_core.cpp)
-    if(TARGET discocal_core_tests)
-        target_link_libraries(discocal_core_tests discocal_core)
-    endif()
+# catkin_add_gtest finds GTest itself: it uses an installed gtest, builds the
+# sources shipped by libgtest-dev under /usr/src/googletest, or -- if neither
+# exists -- warns and skips the target. Do not gate these calls on
+# find_package(GTest) here: on 18.04 libgtest-dev ships headers and sources but
+# no archive, so that probe fails and the tests would vanish silently rather
+# than be built from source. Each test supplies its own main() because
+# catkin_add_gtest links gtest but not gtest_main.
+catkin_add_gtest(discocal_core_tests test/test_core.cpp)
+if(TARGET discocal_core_tests)
+    target_link_libraries(discocal_core_tests discocal_core)
+endif()
+
+catkin_add_gtest(discocal_external_tests test/test_external.cpp)
+if(TARGET discocal_external_tests)
+    target_link_libraries(discocal_external_tests discocal_core)
 endif()
 
 # ---------------------------------------------------------------------------

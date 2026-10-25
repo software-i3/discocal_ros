@@ -360,6 +360,7 @@ void RigSession::reset() {
 RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& interrupt) {
     RigSessionResult out;
     out.attempts = ++attempts_;
+    out.pose_source = rig_.solve.pose_source;
     // Polled between stages only. A solve in flight is never torn down: the
     // caller gets a clear "interrupted" result and the action reports preempted.
     const auto interrupted = [&interrupt]() { return interrupt && interrupt(); };
@@ -434,6 +435,11 @@ RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& i
         outcome.result.reprojection_error = st.solved.reprojection_error;
         outcome.result.fit_seconds = st.solved.fit_seconds;
         outcome.result.raw_output_directory = st.solved.raw_output_directory;
+        outcome.result.pose_source = st.solved.pose_source;
+        outcome.result.frames_matched = st.solved.matched_frames;
+        outcome.result.frames_ambiguous = st.solved.ambiguous_frames;
+        outcome.result.frames_rejected_external = st.solved.rejected_external_frames;
+        outcome.result.mean_rigidity_rms_m = st.solved.mean_rigidity_rms_m;
         if (!st.solved.ok) {
             outcome.result.message = st.solved.message;
             all_solved = false;
@@ -459,7 +465,18 @@ RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& i
     std::string joint_failure;
     bool joint_attempted = false;
 
-    if (rig_.solve.joint_refine && all_solved) {
+    if (rig_.solve.pose_source == "external") {
+        if (rig_.solve.joint_refine) {
+            // The external path has no free board-pose parameters to share:
+            // each frame's pose is a measurement, and with the extrinsic held
+            // fixed the two camera problems separate completely. A joint solve
+            // would either do nothing or silently re-estimate the measured
+            // poses, so it is deliberately skipped.
+            out.warnings.push_back(
+                "joint refinement is not applicable to externally measured board poses "
+                "(solve.pose_source: external); using the two mono results");
+        }
+    } else if (rig_.solve.joint_refine && all_solved) {
         if (rig_.board.type != "circle") {
             out.warnings.push_back(
                 "joint refinement is only implemented for circle boards; using the two mono "
@@ -844,7 +861,10 @@ RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& i
     if (out.success) {
         message << "calibrated " << cameras_[0] << " and " << cameras_[1];
         message << "; shared holdout " << shared.size() << " frame(s)";
-        message << "; joint refinement " << (out.joint_refined ? "applied" : "not applied");
+        message << "; joint refinement "
+                << (out.joint_refined
+                        ? "applied"
+                        : (out.pose_source == "external" ? "not applicable" : "not applied"));
         message << "; wrote " << run_directory_;
     } else {
         message << "both-camera calibration failed";
@@ -891,6 +911,7 @@ RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& i
     yaml << "  started_at: " << quote(started_at_) << "\n";
     yaml << "  finished_at: " << quote(iso8601(std::time(NULL))) << "\n";
     yaml << "  attempts: " << attempts_ << "\n";
+    yaml << "  pose_source: " << quote(out.pose_source) << "\n";
     yaml << "  success: " << boolean(out.success) << "\n";
     yaml << "  check_ran: " << boolean(check_ran) << "\n";
     yaml << "  check_passed: " << boolean(check_passed) << "\n";
@@ -974,6 +995,13 @@ RigSessionResult RigSession::solve(bool allow_unchecked, const InterruptCheck& i
         yaml << "    n_frames_heldout: " << camera.result.n_frames_heldout << "\n";
         yaml << "    reprojection_error: " << exact(camera.result.reprojection_error) << "\n";
         yaml << "    fit_seconds: " << exact(camera.result.fit_seconds) << "\n";
+        yaml << "    pose_source: " << quote(camera.result.pose_source) << "\n";
+        yaml << "    frames_matched: " << camera.result.frames_matched << "\n";
+        yaml << "    frames_ambiguous: " << camera.result.frames_ambiguous << "\n";
+        yaml << "    frames_rejected_external: "
+             << camera.result.frames_rejected_external << "\n";
+        yaml << "    mean_rigidity_rms_m: "
+             << exact(camera.result.mean_rigidity_rms_m) << "\n";
         yaml << "    camera_info_path: " << quote(camera.result.camera_info_path) << "\n";
         yaml << "    raw_output_directory: "
              << quote(camera.result.raw_output_directory) << "\n";

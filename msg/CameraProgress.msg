@@ -14,3 +14,9 @@ uint32 frames_duplicate   # rejected by the pose-diversity gate
 uint32 frames_unpaired    # dropped: no simultaneous frame from the other camera
 uint32 budget             # accepted-frame budget for this camera
 float32 progress          # accepted / budget, capped at 1.0
+
+# External-pose mode counters. Detections without a usable pose sample never
+# enter the pose-diversity gate, so they are counted separately from
+# frames_duplicate. Both are zero in image mode.
+uint32 frames_pose_missing   # no pose sample within sync_tolerance_s
+uint32 frames_pose_invalid   # sample present but unusable (size, frame_id, values)

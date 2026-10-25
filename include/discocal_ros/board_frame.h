@@ -20,6 +20,34 @@ class MomentsTracker;
 
 namespace discocal_ros {
 
+// The externally-supplied dot positions for one frame, in the camera's optical
+// frame and indexed by the dot's original label. This is what turns the board
+// pose from an unknown into a measurement: the solver reprojects the nominal
+// lattice through the pose fitted from these points instead of estimating a
+// pose from the pixels.
+//
+// `present` is false when no pose sample was available (no topic, a stamp
+// outside sync_tolerance_s, an unusable message). `error` then says why, and
+// the session counts the frame as pose-missing rather than silently solving
+// with fewer frames.
+struct ExternalPoints {
+    bool present = false;
+    // True when the sample's points were linearly interpolated between two
+    // bracketing messages at this frame's stamp. False for an exact/nearest
+    // sample.
+    bool interpolated = false;
+    // Stamp of the message the points came from (the earlier one when
+    // interpolated).
+    std::int64_t source_stamp_ns = 0;
+    // |frame stamp - source stamp| in seconds; for an interpolated sample, the
+    // distance to the nearer bracket.
+    double dt_s = 0.0;
+    std::string frame_id;
+    std::string error;
+    // One position per label. Size == n_x*n_y for a usable message.
+    std::vector<Eigen::Vector3d> points;
+};
+
 struct BoardFrame {
     std::string camera;
     // header.stamp in nanoseconds. The two cameras of this rig are stamped from
@@ -28,6 +56,12 @@ struct BoardFrame {
     std::int64_t stamp_ns = 0;
     // The detector's dots, in the order TargetDetector::detect returns them.
     std::vector<::Shape> shapes;
+    // Populated whenever the camera has a point_pose_topic and a sample was
+    // found for this frame; only solve.pose_source == "external" consumes it.
+    // Attaching it regardless lets a per-goal override switch sources without
+    // restarting the node, and lets the cross-camera check use it when the
+    // other camera is not the one being solved.
+    ExternalPoints external;
 };
 
 // The board's dots in board-frame metres, in the same order the detector
@@ -66,6 +100,13 @@ public:
     // board, 2 for a square one.
     Eigen::Vector2d project(double wx, double wy, double radius, const Eigen::Matrix4d& T,
                             const ::Params& params, int mode) const;
+
+    // Every lattice dot through one pose. The symmetry matcher scores one
+    // candidate per permutation per frame, so this is the hot loop; one
+    // projector (and one MomentsTracker) is reused across all of them.
+    std::vector<Eigen::Vector2d> project_all(const std::vector<Eigen::Vector3d>& lattice,
+                                             double radius, const Eigen::Matrix4d& T,
+                                             const ::Params& params, int mode) const;
 
     // The library's own calibration residual, reproduced from its private
     // Calibrator::cal_reprojection_error (lib_calib/CCalibrator.cpp:447):

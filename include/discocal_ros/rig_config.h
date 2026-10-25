@@ -126,13 +126,94 @@ struct PerformanceConfig {
 
 // Joint refinement policy for both-camera goals. Mono goals ignore this group.
 struct SolveConfig {
+    // Where each frame's board pose comes from.
+    //
+    //   "image"    -- the library's usual path: estimate a board pose per
+    //                 frame from the detected dots and refine K/d and the
+    //                 poses together. The detector's vector index is assumed
+    //                 to match board_lattice's index.
+    //   "external" -- every accepted frame carries the target dots' positions
+    //                 in that camera's optical frame (a geometry_msgs/PoseArray
+    //                 per camera). The board pose is then known, not estimated,
+    //                 and only K/d are solved. The external points are indexed
+    //                 by the dot's original label, so an index permutation is
+    //                 resolved per frame from the lattice's symmetry group.
+    //
+    // The exposed value is the default for a goal; CalibrateCamera's
+    // `pose_source` can override it per goal.
+    std::string pose_source = "image";
     // Refine both intrinsic sets (and all board poses) together with the
-    // extrinsic held bit-constant. Circle boards only.
+    // extrinsic held bit-constant. Circle boards only. Not applicable to
+    // "external", where the poses are already known and there are no shared
+    // free board-pose parameters; it is skipped with a warning.
     bool joint_refine = true;
     // When the joint solve fails, fall back to the two mono results instead of
     // failing the goal. The fallback still evaluates and writes the artifacts,
     // with joint_refined: false in the run summary.
     bool joint_refine_fallback = true;
+};
+
+// Tuning for solve.pose_source == "external".
+struct ExternalConfig {
+    // --- time synchronization ---------------------------------------------
+    //
+    // The arm is moving continuously, so the pose sample at the image stamp is
+    // what the pixel observations actually correspond to. Poses arrive on
+    // their own topic and are looked up by header.stamp.
+    double sync_tolerance_s = 0.02;
+    // Largest spacing between the two bracketing pose samples that may be
+    // interpolated. A larger gap falls back to the nearest sample (still
+    // subject to sync_tolerance_s).
+    double max_gap_s = 0.1;
+    // Linear interpolation between bracketing samples, per dot label. False
+    // selects the nearest sample.
+    bool interpolate = true;
+
+    // --- matching ----------------------------------------------------------
+    //
+    // The teammate's publisher indexes points by the label the dot had before
+    // it was glued to the board; it does not know or care whether the board is
+    // flipped. The nominal lattice's dihedral symmetries are therefore tried
+    // per frame, and the external points are reordered to the detector's
+    // order through the best one.
+    //
+    // How far the external dot cloud may be from a rigid copy of the nominal
+    // lattice. This validates the pose independently of K, because the
+    // rigidity residual is invariant under a relabeling of a symmetric
+    // lattice. Metres.
+    double max_rigidity_rms_m = 0.003;
+    // Best symmetry candidate's conic reprojection RMS must be below this.
+    double max_match_rms_px = 3.0;
+    // If the second-best symmetry is within this of the best, the frame is
+    // ambiguous. Labels normally disambiguate even a face-on symmetric board;
+    // this fires when the competing candidates project onto nearly the same
+    // pixels (small, distant, or edge-on board) or when detector noise is of
+    // that order.
+    double min_match_margin_px = 0.25;
+    // A frame whose previous permutation still scores within this of the best
+    // keeps the previous permutation, so a borderline frame does not flicker
+    // between two labels. Set to 0 to disable temporal continuity.
+    double temporal_margin_px = 0.5;
+    // "skip" -> ambiguous frames do not enter the solve.
+    // "use_best" -> they enter with their best-scoring permutation.
+    std::string ambiguous_policy = "skip";
+    // EM iterations: match with the current K/d, solve K/d with the matched
+    // permutations fixed, rematch, repeat until the permutations are stable.
+    int max_em_iterations = 4;
+    // Initialize K from the known 3D-2D correspondences before matching. The
+    // points are already in camera frame, so the pinhole model is linear in
+    // (fx, skew, cx, fy, cy); no board pose or Zhang homography is involved.
+    bool use_dlt_initialization = true;
+    // Use the detector's per-dot covariance to weight the reprojection
+    // residuals, exactly as the vendored CalibrationFunctor does.
+    bool use_covariance_weights = true;
+
+    // --- validation --------------------------------------------------------
+    // Fallback check on the PoseArray's header.frame_id for cameras without
+    // their own cameras.<name>.point_pose_frame_id. The comparison is exact.
+    // Empty disables the check for cameras that also leave the per-camera name
+    // empty.
+    std::string expected_frame_id;
 };
 
 // How many frames to collect and which of them survive the pose-diversity gate.
@@ -189,6 +270,17 @@ struct CameraConfig {
     // block was present" from "it parsed to the zero Params".
     bool has_intrinsics = false;
     ::Params intrinsics;
+
+    // geometry_msgs/PoseArray of the target dots in this camera's OPTICAL
+    // frame (z forward, x right, y down -- the frame the intrinsics model
+    // projects into). Array index = the dot's original label. Required for a
+    // source: calibrate camera when solve.pose_source is "external"; optional
+    // otherwise, and may be set so a per-goal pose_source override can use it.
+    std::string point_pose_topic;
+    // Optical frame the PoseArray's header.frame_id must carry for this camera.
+    // Empty falls back to external.expected_frame_id. Per-camera is the useful
+    // spelling on a stereo rig: two optical frames are never the same frame.
+    std::string point_pose_frame_id;
 };
 
 // The fixed relative pose of `child` in `parent`:
@@ -244,6 +336,7 @@ struct RigConfig {
     DetectorConfig detector;
     PerformanceConfig performance;
     SolveConfig solve;
+    ExternalConfig external;
     FrameConfig frames;
     CheckConfig check;
     OutputConfig output;

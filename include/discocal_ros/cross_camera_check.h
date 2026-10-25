@@ -54,6 +54,16 @@ struct HeldOutFrame {
     std::vector<::Shape> own_shapes;
     // The other camera's detections for the same instant.
     std::vector<::Shape> other_shapes;
+
+    // External-pose mode only. The measured dot positions, in label order, are
+    // what evaluate() needs to solve this frame's pose against the final
+    // intrinsics; in image mode they stay empty/false. `T` above is still the
+    // board pose the check consumes -- external evaluation writes it from the
+    // matched rigid fit.
+    bool has_external = false;
+    bool other_has_external = false;
+    std::vector<Eigen::Vector3d> own_external_points;
+    std::vector<Eigen::Vector3d> other_external_points;
 };
 
 struct CheckResult {
